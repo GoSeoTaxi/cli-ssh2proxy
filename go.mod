@@ -1,1 +1,1 @@
-module cli-ssh2proxy
+module github.com/GoSeoTaxi/cli-ssh2proxy
