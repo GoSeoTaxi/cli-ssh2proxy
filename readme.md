@@ -2,7 +2,7 @@
 
 <p align="center">
   <!-- logo placeholder -->
-  <img src="https://github.com/GoSeoTaxi/cli-ssh2proxy/actions/workflows/ci.yml/logo.png" height="110" alt="ssh2proxy logo">
+  <img src="https://raw.githubusercontent.com/GoSeoTaxi/cli-ssh2proxy/refs/heads/main/actions/workflows/ci.yml/logo.png" height="110" alt="ssh2proxy logo">
 </p>
 
 <p align="center">
