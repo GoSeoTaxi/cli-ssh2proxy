@@ -8,11 +8,9 @@ import (
 	"go.uber.org/zap"
 )
 
-const timeOutGorutineMonitor = 30 * time.Second
-
 var bytes int64
 
-func StartGoroutineMonitor() {
+func StartGoroutineMonitor(timeOutGorutineMonitor time.Duration) {
 	go func() {
 		t := time.NewTicker(timeOutGorutineMonitor)
 		defer t.Stop()

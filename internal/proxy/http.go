@@ -11,6 +11,10 @@ import (
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/sshclient"
 )
 
+const (
+	lifeMax = 60 * time.Minute
+)
+
 func NewHTTP(listen string, dial sshclient.DialFunc) *http.Server {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
@@ -36,17 +40,16 @@ func NewHTTP(listen string, dial sshclient.DialFunc) *http.Server {
 }
 
 func copyBoth(a, b net.Conn) {
-	defer a.Close()
-	defer b.Close()
-
-	const idle = 30 * time.Second
-	reset := func(c net.Conn) { _ = c.SetDeadline(time.Now().Add(idle)) }
-	reset(a)
-	reset(b)
+	defer func() { _ = a.Close() }()
+	defer func() { _ = b.Close() }()
 
 	done := make(chan struct{}, 2)
+
 	go func() { io.Copy(a, b); done <- struct{}{} }()
 	go func() { io.Copy(b, a); done <- struct{}{} }()
 
-	<-done
+	select {
+	case <-done:
+	case <-time.After(lifeMax):
+	}
 }

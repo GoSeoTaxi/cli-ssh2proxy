@@ -8,9 +8,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const periodCPUStat = 30 * time.Second // how often to emit
-
-func StartCPUMonitor() {
+func StartCPUMonitor(periodCPUStat time.Duration) {
 	go func() {
 		p, err := process.NewProcess(int32(os.Getpid()))
 		if err != nil {

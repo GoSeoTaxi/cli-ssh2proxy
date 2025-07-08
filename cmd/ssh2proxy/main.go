@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	keepAliveInterval = 3 * time.Second
-	sleepToReconnect  = 5 * time.Second
-	timeCloser        = 2 * time.Second
+	keepAliveInterval     = 3 * time.Second
+	sleepToReconnect      = 5 * time.Second
+	timeCloser            = 2 * time.Second
+	timeOutIdleConnection = 30 * time.Second
 )
 
 func main() {
@@ -47,14 +48,16 @@ func main() {
 	defer sshCl.Close()
 
 	sshclient.StartKeepAlive(cfg, sshCl, keepAliveInterval)
-	rawDial := sshclient.WrapTimeout(dial)
+	sshclient.StartChannelMonitor(sshCl)
 
+	rawDial := sshclient.WrapTimeout(dial)
 	dialCount := func(ctx context.Context, n, a string) (net.Conn, error) {
-		conn, e := rawDial(ctx, n, a)
+		raw, e := rawDial(ctx, n, a)
 		if e != nil {
 			return nil, e
 		}
-		return metrics.NewTrackConn(&metrics.CountConn{Conn: conn}), nil
+
+		return metrics.NewTrackConn(&metrics.CountConn{Conn: metrics.NewIdleConn(raw, timeOutIdleConnection)}), nil
 	}
 
 	var httpSrv *http.Server
@@ -78,11 +81,11 @@ func main() {
 		}
 	}
 
-	metrics.StartNetMonitor()
-	metrics.StartGoroutineMonitor()
-	metrics.StartOpenConnectionMonitor()
-	metrics.StartMemMonitor()
-	metrics.StartCPUMonitor()
+	metrics.StartNetMonitor(cfg.TimeOutMonitor)
+	metrics.StartGoroutineMonitor(cfg.TimeOutMonitor)
+	metrics.StartOpenConnectionMonitor(cfg.TimeOutMonitor)
+	metrics.StartMemMonitor(cfg.TimeOutMonitor)
+	metrics.StartCPUMonitor(cfg.TimeOutMonitor)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

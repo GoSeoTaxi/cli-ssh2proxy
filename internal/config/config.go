@@ -4,6 +4,8 @@ import (
 	"flag"
 	"log"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -21,7 +23,9 @@ type Config struct {
 
 	UseTUN bool
 
-	Debug bool
+	TimeOutMonitorIntSec int64
+	TimeOutMonitor       time.Duration
+	Debug                bool
 }
 
 func Load() *Config {
@@ -40,7 +44,8 @@ func Load() *Config {
 		Server:   getEnv("SERVER", ""),
 		Port:     getEnv("PORT", ""),
 
-		Debug: getEnv("DEBUG", "false") == "true",
+		TimeOutMonitorIntSec: getEnvInt("TIME_OUT_MONITOR_INT_SEC", 60),
+		Debug:                getEnv("DEBUG", "false") == "true",
 	}
 
 	flag.StringVar(&cfg.Login, "login", cfg.Login, "Login")
@@ -53,12 +58,15 @@ func Load() *Config {
 	flag.StringVar(&cfg.HTTPL, "http", cfg.HTTPL, "HTTP  listen addr")
 
 	flag.BoolVar(&cfg.UseTUN, "tun", cfg.UseTUN, "Use TUN")
+	flag.Int64Var(&cfg.TimeOutMonitorIntSec, "timeout-monitor-int-sec", cfg.TimeOutMonitorIntSec, "Timeout monitor interval in seconds")
 	flag.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Debug")
 	flag.Parse()
 
 	checkSSHConfig(cfg)
 
 	checkProxyConfig(cfg)
+
+	cfg.TimeOutMonitor = time.Duration(cfg.TimeOutMonitorIntSec) * time.Second
 
 	return cfg
 }
@@ -80,4 +88,15 @@ func checkProxyConfig(cfg *Config) {
 	if cfg.SocksL == "" && cfg.HTTPL == "" {
 		log.Fatal("Don't use both SOCKS and HTTP")
 	}
+}
+
+func getEnvInt(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			log.Fatalf("invalid %s: %v", k, err)
+		}
+		return i
+	}
+	return def
 }

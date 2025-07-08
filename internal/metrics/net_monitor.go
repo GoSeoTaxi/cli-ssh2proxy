@@ -7,9 +7,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const timeOutNetStats = 10 * time.Second
-
-func StartNetMonitor() {
+func StartNetMonitor(timeOutNetStats time.Duration) {
 	go func() {
 		for {
 			now := time.Now()
@@ -17,6 +15,10 @@ func StartNetMonitor() {
 			time.Sleep(time.Until(next))
 
 			b := Swap()
+
+			if b == 0 {
+				continue
+			}
 
 			seconds := timeOutNetStats.Seconds()
 			mbps := float64(b*8) / (seconds * 1e6)

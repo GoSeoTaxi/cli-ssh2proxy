@@ -8,8 +8,6 @@ import (
 	"go.uber.org/zap"
 )
 
-const periodOpenStat = 30 * time.Second
-
 var openConns int64
 
 type TrackConn struct {
@@ -29,7 +27,7 @@ func (c *TrackConn) Close() error {
 	return c.Conn.Close()
 }
 
-func StartOpenConnectionMonitor() {
+func StartOpenConnectionMonitor(periodOpenStat time.Duration) {
 	go func() {
 		t := time.NewTicker(periodOpenStat)
 		defer t.Stop()

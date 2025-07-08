@@ -2,11 +2,11 @@
 
 <p align="center">
   <!-- logo placeholder -->
-  <img src="https://raw.githubusercontent.com/GoSeoTaxi/cli-ssh2proxy/main/.github/assets/logo.svg" height="110" alt="ssh2proxy logo">
+  <img src="https://github.com/GoSeoTaxi/cli-ssh2proxy/actions/workflows/ci.yml/logo.png" height="110" alt="ssh2proxy logo">
 </p>
 
 <p align="center">
-  <a href="https://github.com/GoSeoTaxi/cli-ssh2proxy/actions"><img alt="CI" src="https://github.com/GoSeoTaxi/cli-ssh2proxy/actions/workflows/ci.yml/badge.svg"></a>
+<!--   <a href="https://github.com/GoSeoTaxi/cli-ssh2proxy/actions"><img alt="CI" src="https://github.com/GoSeoTaxi/cli-ssh2proxy/actions/workflows/ci.yml/badge.svg"></a>-->
   <a href="https://goreportcard.com/report/github.com/GoSeoTaxi/cli-ssh2proxy"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/GoSeoTaxi/cli-ssh2proxy"></a>
   <a href="https://pkg.go.dev/github.com/GoSeoTaxi/cli-ssh2proxy"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/GoSeoTaxi/cli-ssh2proxy.svg"></a>
   <a href="https://github.com/GoSeoTaxi/cli-ssh2proxy/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/GoSeoTaxi/cli-ssh2proxy?logo=github"></a>

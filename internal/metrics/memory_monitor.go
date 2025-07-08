@@ -7,9 +7,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const periodMemStat = 30 * time.Second
-
-func StartMemMonitor() {
+func StartMemMonitor(periodMemStat time.Duration) {
 	go func() {
 		t := time.NewTicker(periodMemStat)
 		defer t.Stop()
