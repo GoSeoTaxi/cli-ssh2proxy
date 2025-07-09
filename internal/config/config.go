@@ -20,12 +20,14 @@ type Config struct {
 
 	SocksL string
 	HTTPL  string
+	DNSv6  bool
 
 	UseTUN bool
 
 	TimeOutMonitorIntSec int64
 	TimeOutMonitor       time.Duration
 	Debug                bool
+	DNSServers           []string
 }
 
 func Load() *Config {
@@ -44,6 +46,8 @@ func Load() *Config {
 		Server:   getEnv("SERVER", ""),
 		Port:     getEnv("PORT", ""),
 
+		DNSv6: getEnv("DNS_IPV6", "false") == "true",
+
 		TimeOutMonitorIntSec: getEnvInt("TIME_OUT_MONITOR_INT_SEC", 60),
 		Debug:                getEnv("DEBUG", "false") == "true",
 	}
@@ -59,6 +63,9 @@ func Load() *Config {
 
 	flag.BoolVar(&cfg.UseTUN, "tun", cfg.UseTUN, "Use TUN")
 	flag.Int64Var(&cfg.TimeOutMonitorIntSec, "timeout-monitor-int-sec", cfg.TimeOutMonitorIntSec, "Timeout monitor interval in seconds")
+
+	flag.BoolVar(&cfg.DNSv6, "dnsv6", cfg.DNSv6, "Resolve AAAA records too")
+
 	flag.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Debug")
 	flag.Parse()
 
@@ -67,6 +74,14 @@ func Load() *Config {
 	checkProxyConfig(cfg)
 
 	cfg.TimeOutMonitor = time.Duration(cfg.TimeOutMonitorIntSec) * time.Second
+
+	cfg.DNSServers = []string{
+		"https://dns.cloudflare.com/dns-query",
+		"https://dns.google/dns-query",
+		"https://dns.quad9.net/dns-query",
+		"1.1.1.1:53",
+		"8.8.8.8:53",
+	}
 
 	return cfg
 }

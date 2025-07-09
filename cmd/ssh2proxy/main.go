@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	keepAliveInterval     = 3 * time.Second
+	keepAliveInterval     = 1 * time.Second
 	sleepToReconnect      = 5 * time.Second
 	timeCloser            = 2 * time.Second
 	timeOutIdleConnection = 30 * time.Second
@@ -31,6 +31,8 @@ func main() {
 	cfg := config.Load()
 	logger.Init(cfg.Debug)
 
+	bootDNS := proxy.NewDNSResolver(cfg.DNSServers, cfg.DNSv6, nil)
+
 	var (
 		sshCl *sshclient.Reconnector
 		dial  sshclient.DialFunc
@@ -38,11 +40,18 @@ func main() {
 	)
 
 	for {
-		sshCl, dial, err = sshclient.New(cfg.Login, cfg.Password, cfg.Server, cfg.Port, cfg.KeyPath)
-		if err == nil {
+		_, ip, er := bootDNS.ResolveBoot(context.Background(), cfg.Server)
+		if er != nil {
+			zap.L().Info("bootstrap DNS failed", zap.Error(er))
+			time.Sleep(sleepToReconnect)
+			continue
+		}
+
+		sshCl, dial, er = sshclient.New(cfg.Login, cfg.Password, ip.String(), cfg.Port, cfg.KeyPath)
+		if er == nil {
 			break
 		}
-		zap.L().Info("SSH connect failed", zap.Error(err), zap.String("sleep", "10s"))
+		zap.L().Info("SSH connect failed", zap.Error(er), zap.String("sleep", "10s"))
 		time.Sleep(sleepToReconnect)
 	}
 	defer sshCl.Close()
@@ -52,6 +61,10 @@ func main() {
 
 	rawDial := sshclient.WrapTimeout(dial)
 	dialCount := func(ctx context.Context, n, a string) (net.Conn, error) {
+		if err := sshclient.RejectIPv6(a, cfg.DNSv6); err != nil {
+			return nil, err
+		}
+
 		raw, e := rawDial(ctx, n, a)
 		if e != nil {
 			return nil, e
@@ -67,7 +80,7 @@ func main() {
 
 	var socksSrv *proxy.SocksServer
 	if cfg.SocksL != "" {
-		socksSrv, err = proxy.NewSOCKS(cfg.SocksL, dialCount)
+		socksSrv, err = proxy.NewSOCKS(cfg, dialCount)
 		if err != nil {
 			zap.L().Fatal("SOCKS", zap.Error(err))
 		}

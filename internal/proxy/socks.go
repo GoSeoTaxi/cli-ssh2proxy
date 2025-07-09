@@ -9,12 +9,8 @@ import (
 	"github.com/armon/go-socks5"
 	"go.uber.org/zap"
 
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/config"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/sshclient"
-)
-
-const (
-	dsnCF = "1.1.1.1:53"
-	dnsG  = "8.8.8.8:53"
 )
 
 type SocksServer struct {
@@ -23,9 +19,9 @@ type SocksServer struct {
 	ln     net.Listener
 }
 
-func NewSOCKS(listen string, dial sshclient.DialFunc) (*SocksServer, error) {
+func NewSOCKS(cfg *config.Config, dial sshclient.DialFunc) (*SocksServer, error) {
 
-	dnsR := newDNSResolver([]string{dsnCF, dnsG}, dial)
+	dnsR := NewDNSResolver(cfg.DNSServers, cfg.DNSv6, dial)
 
 	srv, e := socks5.New(&socks5.Config{
 		Dial:     dial,
@@ -36,14 +32,14 @@ func NewSOCKS(listen string, dial sshclient.DialFunc) (*SocksServer, error) {
 		return nil, e
 	}
 
-	ln, e := net.Listen("tcp", listen)
+	ln, e := net.Listen("tcp", cfg.SocksL)
 	if e != nil {
 		return nil, e
 	}
 
-	ss := &SocksServer{listen, srv, ln}
+	ss := &SocksServer{cfg.SocksL, srv, ln}
 	go func() {
-		zap.L().Info("SOCKS proxy listening on", zap.String("listen", listen))
+		zap.L().Info("SOCKS proxy listening on", zap.String("listen", cfg.SocksL))
 		if err := srv.Serve(ln); err != nil {
 			zap.L().Fatal("SOCKS5 proxy Serve error", zap.Error(err))
 		}

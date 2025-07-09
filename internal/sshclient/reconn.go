@@ -14,11 +14,11 @@ import (
 )
 
 const (
-	timeOutBackoff    = 1 * time.Second
-	countAttemptsDial = 1
-	timeOutWaitSlot   = 20 * time.Millisecond
-	slotTimeoutHard   = 2 * time.Second
-	safeMaxDefault    = 128
+	timeOutBackoff          = 1100 * time.Millisecond
+	countAttemptsDial       = 3
+	timeOutWaitSlot         = 20 * time.Millisecond
+	slotTimeOutHardWaitSlot = 2 * time.Second
+	sshConnTimeout          = 5 * time.Second
 )
 
 type Reconnector struct {
@@ -39,12 +39,11 @@ func NewReconnector(addr string, cfg *ssh.ClientConfig) (*Reconnector, error) {
 		zap.L().Warn("ssh_up_err", zap.String("addr", addr), zap.Error(err))
 		return nil, err
 	}
+
 	r := &Reconnector{addr: addr, cfg: cfg, client: cl}
+	r.startConnMonitor()
+
 	r.maxChans = probeMaxChannels(cl)
-	if r.maxChans == 0 {
-		zap.L().Warn("probe_max_channels_failed – using safe default", zap.Int64("default", safeMaxDefault))
-		r.maxChans = safeMaxDefault
-	}
 
 	zap.L().Info("ssh_up", zap.String("addr", addr), zap.Int64("max_channels", r.maxChans))
 	return r, nil
@@ -122,24 +121,35 @@ func (r *Reconnector) reconnect() error {
 	r.mu.Unlock()
 
 	backoff := timeOutBackoff
-	for attempt := 0; attempt < 5; attempt++ {
-		cl, err := ssh.Dial("tcp", r.addr, r.cfg)
+	for attempt := 0; attempt < countAttemptsDial; attempt++ {
+		d := net.Dialer{Timeout: sshConnTimeout}
+		raw, err := d.Dial("tcp", r.addr)
+
 		if err != nil {
 			zap.L().Warn("ssh_reconnect_err", zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
+
 			time.Sleep(backoff)
 			backoff *= 2
 			continue
 		}
+
+		cc, chans, reqs, err := ssh.NewClientConn(raw, r.addr, r.cfg)
+		if err != nil {
+			_ = raw.Close()
+			zap.L().Warn("ssh_reconnect_err", zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
+
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		cl := ssh.NewClient(cc, chans, reqs)
 
 		r.mu.Lock()
 		r.client = cl
 		r.mu.Unlock()
 
 		r.maxChans = probeMaxChannels(cl)
-		if r.maxChans == 0 {
-			zap.L().Warn("probe_max_channels_failed – using safe default", zap.Int64("default", safeMaxDefault))
-			r.maxChans = safeMaxDefault
-		}
+
 		atomic.StoreInt64(&r.chanCnt, 0)
 
 		zap.L().Info("ssh_reconnect_ok", zap.Int("attempt", attempt+1), zap.Duration("backoff_used", backoff/2), zap.Int64("max_channels", r.maxChans))
@@ -166,8 +176,6 @@ type channelConn struct {
 func (c *channelConn) Close() error {
 	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		atomic.AddInt64(&c.rec.chanCnt, -1)
-		//	newCnt := atomic.AddInt64(&c.rec.chanCnt, -1)
-		//	zap.L().Debug("ssh_channel_close", zap.Int64("open_channels", newCnt))
 	}
 	return c.Conn.Close()
 }
@@ -176,29 +184,11 @@ func (r *Reconnector) Channels() int64 {
 	return atomic.LoadInt64(&r.chanCnt)
 }
 
-/*
 func (r *Reconnector) waitForSlot(ctx context.Context) error {
 	if r.maxChans == 0 {
 		return nil
 	}
-	for {
-		if atomic.LoadInt64(&r.chanCnt) < r.maxChans {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(timeOutWaitSlot):
-		}
-	}
-}
-*/
-
-func (r *Reconnector) waitForSlot(ctx context.Context) error {
-	if r.maxChans == 0 {
-		return nil
-	}
-	deadline := time.NewTimer(slotTimeoutHard)
+	deadline := time.NewTimer(slotTimeOutHardWaitSlot)
 	defer deadline.Stop()
 
 	for {

@@ -1,11 +1,8 @@
-// internal/sshclient/probe_maxchans.go
 package sshclient
 
 import (
 	"context"
-	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,10 +11,10 @@ import (
 
 func probeMaxChannels(cl *ssh.Client) int64 {
 	const (
-		safetyCap    = 512
-		workerCnt    = safetyCap / 2
-		probeTimeout = 10 * time.Second
-		singleTO     = 2000 * time.Millisecond
+		safetyCap      = 512
+		workers        = safetyCap / 4
+		probeTimeout   = 1 * time.Second
+		safeMaxDefault = 64
 	)
 
 	targets := []string{
@@ -25,86 +22,70 @@ func probeMaxChannels(cl *ssh.Client) int64 {
 		"8.8.8.8:443",
 	}
 
-	type token struct{}
-	taskCh := make(chan token, safetyCap)
-	stopCh := make(chan struct{})
+	type result struct {
+		ok    bool
+		limit bool
+		fatal bool
+	}
 
-	var openedMu sync.Mutex
-	var opened []net.Conn // все успешно открытые каналы
-	var openedCnt int64   // через atomic – чтобы быстро проверять лимит
+	jobs := make(chan int, safetyCap)
+	results := make(chan result, safetyCap)
 
-	// ---------------- workers ----------------
 	var wg sync.WaitGroup
-	wg.Add(workerCnt)
-
-	dialOnce := func(tgt string) (net.Conn, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), singleTO)
-		defer cancel()
-		return cl.DialContext(ctx, "tcp", tgt)
-	}
-
-	for w := 0; w < workerCnt; w++ {
-		go func(workerID int) {
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
 			defer wg.Done()
-			for range taskCh {
-				// досрочно вышли?
-				if atomic.LoadInt64(&openedCnt) >= safetyCap {
-					return
-				}
+			for idx := range jobs {
+				tgt := targets[idx%len(targets)]
 
-				tgt := targets[workerID%len(targets)] // пусть каждый воркер бьёт в свой tgt
-				c, err := dialOnce(tgt)
+				ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+				conn, err := cl.DialContext(ctx, "tcp", tgt)
+				cancel()
 
-				switch {
-				case err == nil:
-					openedMu.Lock()
-					opened = append(opened, c)
-					openedMu.Unlock()
-					atomic.AddInt64(&openedCnt, 1)
-
-				case func() bool { _, ok := err.(*ssh.OpenChannelError); return ok }():
-					// достигнут потолок – тушим всё
-					close(stopCh)
-					return
-
+				switch e := err.(type) {
+				case nil:
+					_ = conn.Close()
+					results <- result{ok: true}
+				case *ssh.OpenChannelError:
+					switch e.Reason {
+					case ssh.ResourceShortage:
+						results <- result{limit: true}
+						return
+					default:
+						results <- result{ok: true}
+					}
 				default:
-					// что-то другое (network / timeout / EOF) – прекращаем probe
-					close(stopCh)
+					results <- result{fatal: true}
 					return
 				}
 			}
-		}(w)
+		}()
 	}
 
-	// ---------------- producer ----------------
-	go func() {
-		defer close(taskCh)
-		for i := 0; i < safetyCap; i++ {
-			select {
-			case <-stopCh:
-				return
-			default:
-				taskCh <- token{}
-			}
+	for i := 0; i < safetyCap; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	go func() { wg.Wait(); close(results) }()
+
+	var okCnt int64
+	for r := range results {
+		if r.fatal {
+			continue
 		}
-	}()
-
-	// ждём либо таймаут всего probe, либо завершение worker-ов
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(probeTimeout):
-		zap.L().Warn("probe_max_channels_timeout", zap.Duration("timeout", probeTimeout))
+		if r.ok {
+			okCnt++
+		}
+		if r.limit {
+			continue
+		}
 	}
 
-	// прибираем за собой
-	for _, c := range opened {
-		_ = c.Close()
+	if okCnt == 0 || okCnt < safeMaxDefault {
+		zap.L().Warn("probe_max_channels_failed – using safe default", zap.Int("default", safeMaxDefault))
+		return safeMaxDefault
 	}
-	return atomic.LoadInt64(&openedCnt)
+	return okCnt
 }
