@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/config"
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/forward"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/logger"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/metrics"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/proxy"
@@ -72,6 +73,13 @@ func main() {
 
 		return metrics.NewTrackConn(&metrics.CountConn{Conn: metrics.NewIdleConn(raw, timeOutIdleConnection)}), nil
 	}
+
+	var fwd *forward.TCPForwarder
+	fwd, err = forward.StartTCP(cfg.UDPGWLocal, cfg.UDPGWRemote, dialCount)
+	if err != nil {
+		zap.L().Fatal("udpgw forward", zap.Error(err))
+	}
+	defer fwd.Close()
 
 	var httpSrv *http.Server
 	if cfg.HTTPL != "" {

@@ -28,6 +28,9 @@ type Config struct {
 	TimeOutMonitor       time.Duration
 	Debug                bool
 	DNSServers           []string
+
+	UDPGWRemote string
+	UDPGWLocal  string
 }
 
 func Load() *Config {
@@ -50,6 +53,9 @@ func Load() *Config {
 
 		TimeOutMonitorIntSec: getEnvInt("TIME_OUT_MONITOR_INT_SEC", 60),
 		Debug:                getEnv("DEBUG", "false") == "true",
+
+		UDPGWRemote: getEnv("UDPGW_REMOTE", "127.0.0.1:7300"),
+		UDPGWLocal:  getEnv("UDPGW_LOCAL", "127.0.0.1:7300"),
 	}
 
 	flag.StringVar(&cfg.Login, "login", cfg.Login, "Login")
@@ -63,6 +69,9 @@ func Load() *Config {
 
 	flag.BoolVar(&cfg.UseTUN, "tun", cfg.UseTUN, "Use TUN")
 	flag.Int64Var(&cfg.TimeOutMonitorIntSec, "timeout-monitor-int-sec", cfg.TimeOutMonitorIntSec, "Timeout monitor interval in seconds")
+
+	flag.StringVar(&cfg.UDPGWRemote, "udpgw-remote", cfg.UDPGWRemote, "Remote UDPGW addr")
+	flag.StringVar(&cfg.UDPGWLocal, "udpgw-local", cfg.UDPGWLocal, "Local bind for UDPGW forward")
 
 	flag.BoolVar(&cfg.DNSv6, "dnsv6", cfg.DNSv6, "Resolve AAAA records too")
 
