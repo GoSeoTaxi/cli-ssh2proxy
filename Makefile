@@ -19,12 +19,12 @@ split = $(subst _, ,$1)
 os    = $(word 1,$(call split,$1))
 arch  = $(word 2,$(call split,$1))
 
-.PHONY: all app tun clean
+.PHONY: all app tun update-readme clean
 all: tun app
 
-app: | $(DIST) $(addprefix $(DIST)/$(APP)-,$(PLATFORMS))
+app: update-readme
 
-$(DIST)/$(APP)-%:
+$(DIST)/$(APP)-%: | $(DIST)
 	$(eval OS   := $(call os,$*))
 	$(eval ARCH := $(call arch,$*))
 	$(eval OUT  := $@$(if $(findstring windows,$(OS)),.exe,))   # ← NEW
@@ -33,6 +33,10 @@ $(DIST)/$(APP)-%:
 	    go build $(GOFLAGS) -o $(OUT) $(MAIN_PKG)
 
 	@echo "→ $(OUT)"
+
+update-readme: $(addprefix $(DIST)/$(APP)-,$(PLATFORMS))
+	@PLATFORMS="$(PLATFORMS)" APP="$(APP)" DIST="$(DIST)" \
+	    python3 scripts/update_readme.py
 
 tun: | $(TUN_DIR) $(addprefix $(TUN_DIR)/tun2socks-,$(PLATFORMS))
 
