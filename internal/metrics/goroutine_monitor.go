@@ -15,7 +15,7 @@ func StartGoroutineMonitor(timeOutGorutineMonitor time.Duration) {
 		t := time.NewTicker(timeOutGorutineMonitor)
 		defer t.Stop()
 		for range t.C {
-			zap.L().Debug("goroutines", zap.Int("count", runtime.NumGoroutine()))
+			zap.L().Info("goroutines", zap.Int("count", runtime.NumGoroutine()))
 		}
 	}()
 }

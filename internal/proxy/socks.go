@@ -17,17 +17,25 @@ type SocksServer struct {
 	listen string
 	srv    *socks5.Server
 	ln     net.Listener
+	dnsR   *DNSResolver
 }
 
 func NewSOCKS(cfg *config.Config, dial sshclient.DialFunc) (*SocksServer, error) {
 
 	dnsR := NewDNSResolver(cfg.DNSServers, cfg.DNSv6, dial)
 
-	srv, e := socks5.New(&socks5.Config{
+	conf := &socks5.Config{
 		Dial:     dial,
 		Resolver: dnsR,
 		Logger:   log.New(io.Discard, "", 0),
-	})
+	}
+	if cfg.SocksUser != "" || cfg.SocksPass != "" {
+		conf.Credentials = socks5.StaticCredentials{
+			cfg.SocksUser: cfg.SocksPass,
+		}
+	}
+
+	srv, e := socks5.New(conf)
 	if e != nil {
 		return nil, e
 	}
@@ -37,7 +45,7 @@ func NewSOCKS(cfg *config.Config, dial sshclient.DialFunc) (*SocksServer, error)
 		return nil, e
 	}
 
-	ss := &SocksServer{cfg.SocksL, srv, ln}
+	ss := &SocksServer{cfg.SocksL, srv, ln, dnsR}
 	go func() {
 		zap.L().Info("SOCKS proxy listening on", zap.String("listen", cfg.SocksL))
 		if err := srv.Serve(ln); err != nil {
@@ -49,4 +57,11 @@ func NewSOCKS(cfg *config.Config, dial sshclient.DialFunc) (*SocksServer, error)
 
 func (s *SocksServer) Shutdown(_ context.Context) error {
 	return s.ln.Close()
+}
+
+func (s *SocksServer) DNSCacheLen() int {
+	if s == nil || s.dnsR == nil {
+		return 0
+	}
+	return s.dnsR.CacheLen()
 }

@@ -50,9 +50,15 @@ func StartTCP(localListen, remoteAddr string, dial sshclient.DialFunc) (*TCPForw
 					zap.L().Warn("tcp_forwarder dial", zap.String("remote", remoteAddr), zap.Error(err))
 					return
 				}
+				var closeOnce sync.Once
+				closeBoth := func() {
+					closeOnce.Do(func() {
+						_ = src.Close()
+						_ = dst.Close()
+					})
+				}
 				pipe := func(a, b net.Conn) {
-					defer a.Close()
-					defer b.Close()
+					defer closeBoth()
 					_, _ = io.Copy(a, b)
 				}
 				go pipe(src, dst)

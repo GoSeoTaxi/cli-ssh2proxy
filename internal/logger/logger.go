@@ -19,14 +19,21 @@ func Init(debug bool) {
 		EncodeLevel:  zapcore.LowercaseLevelEncoder,
 		EncodeCaller: zapcore.ShortCallerEncoder,
 	}
-	level := zap.InfoLevel
-	if debug {
-		level = zap.DebugLevel
-	}
+	enabler := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
+		if debug {
+			return lvl >= zapcore.DebugLevel
+		}
+		switch lvl {
+		case zapcore.InfoLevel, zapcore.PanicLevel, zapcore.DPanicLevel, zapcore.FatalLevel:
+			return true
+		default:
+			return false
+		}
+	})
 	core := zapcore.NewCore(
 		zapcore.NewJSONEncoder(encCfg),
 		zapcore.AddSync(os.Stdout),
-		level,
+		enabler,
 	)
 	L = zap.New(core, zap.AddCaller())
 	zap.ReplaceGlobals(L)

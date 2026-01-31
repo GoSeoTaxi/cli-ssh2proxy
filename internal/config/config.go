@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -22,11 +23,18 @@ type Config struct {
 	HTTPL  string
 	DNSv6  bool
 
+	SocksUser  string
+	SocksPass  string
+	HTTPUser   string
+	HTTPPass   string
+	SocksProxy string
+
 	UseTUN bool
 
 	TimeOutMonitorIntSec int64
 	TimeOutMonitor       time.Duration
 	Debug                bool
+	DNSProvider          string
 	DNSServers           []string
 
 	UDPGWRemote string
@@ -53,9 +61,19 @@ func Load() *Config {
 
 		TimeOutMonitorIntSec: getEnvInt("TIME_OUT_MONITOR_INT_SEC", 60),
 		Debug:                getEnv("DEBUG", "false") == "true",
+		DNSProvider:          getEnv("DNS_PROVIDER", ""),
 
 		UDPGWRemote: getEnv("UDPGW_REMOTE", "127.0.0.1:7300"),
 		UDPGWLocal:  getEnv("UDPGW_LOCAL", "127.0.0.1:7300"),
+	}
+	if cfg.DNSProvider == "" {
+		cfg.DNSProvider = getEnv("DNS_Провайдер", "")
+	}
+	if cfg.DNSProvider == "" {
+		cfg.DNSProvider = getEnv("DNS_ПРОВАЙДЕР", "")
+	}
+	if cfg.DNSProvider == "" {
+		cfg.DNSProvider = "DNS_QUERY"
 	}
 
 	flag.StringVar(&cfg.Login, "login", cfg.Login, "Login")
@@ -75,8 +93,21 @@ func Load() *Config {
 
 	flag.BoolVar(&cfg.DNSv6, "dnsv6", cfg.DNSv6, "Resolve AAAA records too")
 
+	flag.StringVar(&cfg.DNSProvider, "dns-provider", cfg.DNSProvider, "DNS provider: DOH_GOOGLE, DOH_CF, DNS_QUERY, DIRECT")
+
 	flag.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Debug")
 	flag.Parse()
+
+	var err error
+	cfg.SocksL, cfg.SocksUser, cfg.SocksPass, err = parseListenAddr(cfg.SocksL, "SOCKS_LSN")
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.HTTPL, cfg.HTTPUser, cfg.HTTPPass, err = parseListenAddr(cfg.HTTPL, "HTTP_LSN")
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.SocksProxy = buildProxyAddr(cfg.SocksL, cfg.SocksUser, cfg.SocksPass)
 
 	checkSSHConfig(cfg)
 
@@ -84,13 +115,7 @@ func Load() *Config {
 
 	cfg.TimeOutMonitor = time.Duration(cfg.TimeOutMonitorIntSec) * time.Second
 
-	cfg.DNSServers = []string{
-		"https://dns.cloudflare.com/dns-query",
-		"https://dns.google/dns-query",
-		"https://dns.quad9.net/dns-query",
-		"1.1.1.1:53",
-		"8.8.8.8:53",
-	}
+	cfg.DNSServers = buildDNSServers(cfg.DNSProvider)
 
 	return cfg
 }
@@ -110,7 +135,7 @@ func checkSSHConfig(cfg *Config) {
 
 func checkProxyConfig(cfg *Config) {
 	if cfg.SocksL == "" && cfg.HTTPL == "" {
-		log.Fatal("Don't use both SOCKS and HTTP")
+		log.Fatal("Need at least one of SOCKS or HTTP listen addresses")
 	}
 }
 
@@ -123,4 +148,24 @@ func getEnvInt(k string, def int64) int64 {
 		return i
 	}
 	return def
+}
+
+func buildDNSServers(provider string) []string {
+	switch strings.ToUpper(strings.TrimSpace(provider)) {
+	case "DOH_GOOGLE":
+		return []string{"https://dns.google/resolve"}
+	case "DOH_CF":
+		return []string{"https://cloudflare-dns.com/dns-query"}
+	case "DNS_QUERY":
+		return []string{
+			"1.1.1.1:53",
+			"8.8.8.8:53",
+			"9.9.9.9:53",
+		}
+	case "DIRECT":
+		return nil
+	default:
+		log.Fatalf("invalid DNS_PROVIDER: %s", provider)
+		return nil
+	}
 }

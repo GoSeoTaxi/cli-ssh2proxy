@@ -2,14 +2,16 @@ package metrics
 
 import (
 	"net"
+	"sync"
 	"time"
 )
 
 type IdleConn struct {
 	net.Conn
-	idleTO   time.Duration
-	lastIO   chan struct{}
-	shutdown chan struct{}
+	idleTO    time.Duration
+	lastIO    chan struct{}
+	shutdown  chan struct{}
+	closeOnce sync.Once
 }
 
 func NewIdleConn(c net.Conn, idle time.Duration) *IdleConn {
@@ -52,7 +54,7 @@ func (c *IdleConn) watchdog() {
 			}
 			timer.Reset(c.idleTO)
 		case <-timer.C:
-			_ = c.Conn.Close()
+			_ = c.close()
 			return
 		case <-c.shutdown:
 			return
@@ -61,6 +63,14 @@ func (c *IdleConn) watchdog() {
 }
 
 func (c *IdleConn) Close() error {
-	close(c.shutdown)
-	return c.Conn.Close()
+	return c.close()
+}
+
+func (c *IdleConn) close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		close(c.shutdown)
+		err = c.Conn.Close()
+	})
+	return err
 }

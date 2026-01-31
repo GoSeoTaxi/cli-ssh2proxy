@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"go.uber.org/zap"
 
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/config"
@@ -31,6 +35,7 @@ const (
 func main() {
 	cfg := config.Load()
 	logger.Init(cfg.Debug)
+	logDotEnv()
 
 	bootDNS := proxy.NewDNSResolver(cfg.DNSServers, cfg.DNSv6, nil)
 
@@ -40,19 +45,27 @@ func main() {
 		err   error
 	)
 
+	serverAddr := cfg.Server
+	if ip := net.ParseIP(cfg.Server); ip != nil {
+		serverAddr = ip.String()
+		zap.L().Debug("bootstrap DNS skipped: server is IP", zap.String("server", serverAddr))
+	}
 	for {
-		_, ip, er := bootDNS.ResolveBoot(context.Background(), cfg.Server)
-		if er != nil {
-			zap.L().Info("bootstrap DNS failed", zap.Error(er))
-			time.Sleep(sleepToReconnect)
-			continue
+		if net.ParseIP(serverAddr) == nil {
+			_, ip, err := bootDNS.ResolveBoot(context.Background(), serverAddr)
+			if err != nil {
+				zap.L().Info("bootstrap DNS failed", zap.Error(err))
+				time.Sleep(sleepToReconnect)
+				continue
+			}
+			serverAddr = ip.String()
 		}
 
-		sshCl, dial, er = sshclient.New(cfg.Login, cfg.Password, ip.String(), cfg.Port, cfg.KeyPath)
-		if er == nil {
+		sshCl, dial, err = sshclient.New(cfg.Login, cfg.Password, serverAddr, cfg.Port, cfg.KeyPath)
+		if err == nil {
 			break
 		}
-		zap.L().Info("SSH connect failed", zap.Error(er), zap.String("sleep", "10s"))
+		zap.L().Info("SSH connect failed", zap.Error(err), zap.String("sleep", "10s"))
 		time.Sleep(sleepToReconnect)
 	}
 	defer sshCl.Close()
@@ -83,7 +96,10 @@ func main() {
 
 	var httpSrv *http.Server
 	if cfg.HTTPL != "" {
-		httpSrv = proxy.NewHTTP(cfg.HTTPL, dialCount)
+		httpSrv, err = proxy.NewHTTP(cfg.HTTPL, cfg.HTTPUser, cfg.HTTPPass, dialCount)
+		if err != nil {
+			zap.L().Fatal("HTTP", zap.Error(err))
+		}
 	}
 
 	var socksSrv *proxy.SocksServer
@@ -96,17 +112,35 @@ func main() {
 
 	var cmdTun *exec.Cmd
 	if cfg.UseTUN {
-		cmdTun, err = tun.RunExternal(cfg.SocksL)
+		proxyAddr := cfg.SocksProxy
+		if proxyAddr == "" {
+			proxyAddr = cfg.SocksL
+		}
+		cmdTun, err = tun.RunExternal(proxyAddr)
 		if err != nil {
 			zap.L().Fatal("tun2socks external", zap.Error(err))
 		}
 	}
 
-	metrics.StartNetMonitor(cfg.TimeOutMonitor)
-	metrics.StartGoroutineMonitor(cfg.TimeOutMonitor)
-	metrics.StartOpenConnectionMonitor(cfg.TimeOutMonitor)
-	metrics.StartMemMonitor(cfg.TimeOutMonitor)
-	metrics.StartCPUMonitor(cfg.TimeOutMonitor)
+	if cfg.TimeOutMonitorIntSec > 0 {
+		metrics.StartNetMonitor(cfg.TimeOutMonitor)
+		metrics.StartGoroutineMonitor(cfg.TimeOutMonitor)
+		metrics.StartOpenConnectionMonitor(cfg.TimeOutMonitor)
+		dnsCacheLen := func() int {
+			total := 0
+			if bootDNS != nil {
+				total += bootDNS.CacheLen()
+			}
+			if socksSrv != nil {
+				total += socksSrv.DNSCacheLen()
+			}
+			return total
+		}
+		metrics.StartMemMonitor(cfg.TimeOutMonitor, dnsCacheLen)
+		metrics.StartCPUMonitor(cfg.TimeOutMonitor)
+	} else {
+		zap.L().Info("metrics disabled", zap.Int64("timeout_sec", cfg.TimeOutMonitorIntSec))
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -126,4 +160,77 @@ func main() {
 		_ = cmdTun.Process.Kill()
 	}
 
+}
+
+func logDotEnv() {
+	if _, err := os.Stat(".env"); err != nil {
+		if os.IsNotExist(err) {
+			zap.L().Info(".env not found")
+			return
+		}
+		zap.L().Info(".env stat failed", zap.Error(err))
+		return
+	}
+
+	envMap, err := godotenv.Read()
+	if err != nil {
+		zap.L().Info(".env read failed", zap.Error(err))
+		return
+	}
+
+	masked := make(map[string]string, len(envMap))
+	keys := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		keys = append(keys, k)
+		masked[k] = maskEnvValue(k, v)
+	}
+	sort.Strings(keys)
+
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		lines = append(lines, fmt.Sprintf("%s=%s", k, masked[k]))
+	}
+
+	zap.L().Info(".env loaded", zap.Strings("env", lines))
+}
+
+func maskEnvValue(key, value string) string {
+	if value == "" {
+		return ""
+	}
+	switch strings.ToUpper(strings.TrimSpace(key)) {
+	case "LOGIN", "PASSWORD", "SERVER", "USER", "USERNAME", "SSH_USER", "SSH_LOGIN":
+		if strings.Contains(strings.ToUpper(key), "PASS") {
+			return "******"
+		}
+		return maskMiddle(value)
+	case "SOCKS_LSN", "HTTP_LSN":
+		return maskListenPassword(value)
+	default:
+		return value
+	}
+}
+
+func maskMiddle(value string) string {
+	if len(value) <= 2 {
+		return "**"
+	}
+	return value[:1] + strings.Repeat("*", len(value)-2) + value[len(value)-1:]
+}
+
+func maskListenPassword(value string) string {
+	if value == "" {
+		return ""
+	}
+	at := strings.LastIndex(value, "@")
+	if at == -1 {
+		return value
+	}
+	auth := value[:at]
+	host := value[at+1:]
+	colon := strings.Index(auth, ":")
+	if colon == -1 {
+		return value
+	}
+	return auth[:colon+1] + "******@" + host
 }
