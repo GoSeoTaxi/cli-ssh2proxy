@@ -9,6 +9,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/limits"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/sshclient"
 )
 
@@ -18,11 +19,17 @@ type TCPForwarder struct {
 	stop chan struct{}
 }
 
-func StartTCP(localListen, remoteAddr string, dial sshclient.DialFunc) (*TCPForwarder, error) {
+func StartTCP(localListen, remoteAddr string, dial sshclient.DialFunc, sessions *limits.SessionLimiter) (*TCPForwarder, error) {
 	ln, err := net.Listen("tcp", localListen)
 	if err != nil {
 		return nil, err
 	}
+	ln = limits.WrapListener(ln, limits.ListenerOptions{
+		Protocol:        "tcp_forward",
+		SessionLimiter:  sessions,
+		OverLimitAction: limits.RejectDrop,
+		RateLimitAction: limits.RejectDrop,
+	})
 
 	f := &TCPForwarder{ln: ln, stop: make(chan struct{})}
 	go func() {

@@ -1,6 +1,7 @@
 package sshclient
 
 import (
+	"errors"
 	"time"
 
 	"go.uber.org/zap"
@@ -9,11 +10,26 @@ import (
 )
 
 func StartKeepAlive(cfg *config.Config, r *Reconnector, interval time.Duration) {
+	_ = cfg
+
+	if r.lifecycleErr() != nil {
+		return
+	}
+
+	r.wg.Add(1)
 	go func() {
+		defer r.wg.Done()
+
 		t := time.NewTicker(interval)
 		defer t.Stop()
 
-		for range t.C {
+		for {
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-t.C:
+			}
+
 			r.mu.RLock()
 			cl := r.client
 			r.mu.RUnlock()
@@ -21,7 +37,9 @@ func StartKeepAlive(cfg *config.Config, r *Reconnector, interval time.Duration) 
 			if cl == nil {
 				zap.L().Debug("keepalive: no client")
 				if err := r.reconnect(); err != nil {
-					zap.L().Warn("keepalive: reconnect error", zap.Error(err))
+					if !errors.Is(err, ErrReconnectorClosed) {
+						zap.L().Warn("keepalive: reconnect error", zap.Error(err))
+					}
 				}
 				continue
 			}
@@ -34,15 +52,24 @@ func StartKeepAlive(cfg *config.Config, r *Reconnector, interval time.Duration) 
 				done <- err
 			}()
 
+			timeoutTimer := time.NewTimer(timeout)
 			select {
 			case err := <-done:
+				timeoutTimer.Stop()
 				if err != nil {
 					zap.L().Warn("keepalive: send error", zap.Error(err))
-					_ = r.reconnect()
+					if recErr := r.reconnect(); recErr != nil && !errors.Is(recErr, ErrReconnectorClosed) {
+						zap.L().Warn("keepalive: reconnect error", zap.Error(recErr))
+					}
 				}
-			case <-time.After(timeout):
+			case <-timeoutTimer.C:
 				zap.L().Warn("keepalive: timeout", zap.Duration("after", timeout))
-				_ = r.reconnect()
+				if recErr := r.reconnect(); recErr != nil && !errors.Is(recErr, ErrReconnectorClosed) {
+					zap.L().Warn("keepalive: reconnect error", zap.Error(recErr))
+				}
+			case <-r.ctx.Done():
+				timeoutTimer.Stop()
+				return
 			}
 		}
 	}()

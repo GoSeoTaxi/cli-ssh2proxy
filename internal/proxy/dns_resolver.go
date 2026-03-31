@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	timeOutResolve      = 3 * time.Second       // timeout for DNS lookup
-	dnsCacheMaxEntries  = 100000                // size cache
-	dnsCacheTTLSuccess  = 30 * 60 * time.Second // 30 minutes
-	dnsCacheTTLNegative = 30 * time.Second      // 0.5 minutes
+	timeOutResolve        = 3 * time.Second       // timeout for a single DNS lookup attempt
+	timeOutResolveOverall = 10 * time.Second      // overall timeout budget for DNS fallback sequence
+	dnsCacheMaxEntries    = 100000                // size cache
+	dnsCacheTTLSuccess    = 30 * 60 * time.Second // 30 minutes
+	dnsCacheTTLNegative   = 30 * time.Second      // 0.5 minutes
 )
 
 type dnsJSON struct {
@@ -168,39 +169,37 @@ func (r *DNSResolver) resolveInternal(parent context.Context, name string,
 
 	cacheKey := dnsCacheKey(name, wantType)
 
-	ctx, cancel := context.WithTimeout(parent, timeOutResolve)
-	keepCtx := false
-	defer func() {
-		if !keepCtx {
-			cancel()
-		}
-	}()
-
 	if r.cache != nil {
 		if entry, ok := r.cache.Get(cacheKey); ok {
 			if entry.negative {
 				if entry.errMsg == "" {
-					return ctx, nil, errNoRecord
+					return parent, nil, errNoRecord
 				}
-				return ctx, nil, newNoRecordError(entry.errMsg)
+				return parent, nil, newNoRecordError(entry.errMsg)
 			}
 			if entry.ip != nil {
-				keepCtx = true
-				return ctx, cloneIP(entry.ip), nil
+				return parent, cloneIP(entry.ip), nil
 			}
 		}
 	}
 
+	resolveTimeout := timeOutResolve
+	if len(r.servers) > 0 {
+		resolveTimeout = timeOutResolveOverall
+	}
+	resolveCtx, cancelResolve := context.WithTimeout(parent, resolveTimeout)
+	defer cancelResolve()
+
 	if len(r.servers) == 0 {
-		ips, err := net.DefaultResolver.LookupIP(ctx, wantNet, name)
+		ips, err := net.DefaultResolver.LookupIP(resolveCtx, wantNet, name)
 		if err != nil {
 			if isDNSNotFound(err) {
-				return ctx, nil, newNoRecordError(fmt.Sprintf("no %s record from system resolver", wantType))
+				return parent, nil, newNoRecordError(fmt.Sprintf("no %s record from system resolver", wantType))
 			}
-			return ctx, nil, err
+			return parent, nil, err
 		}
 		if len(ips) == 0 {
-			return ctx, nil, newNoRecordError(fmt.Sprintf("no %s record from system resolver", wantType))
+			return parent, nil, newNoRecordError(fmt.Sprintf("no %s record from system resolver", wantType))
 		}
 		if r.cache != nil {
 			r.cache.Set(cacheKey, dnsCacheEntry{
@@ -208,15 +207,14 @@ func (r *DNSResolver) resolveInternal(parent context.Context, name string,
 				expiresAt: time.Now().Add(dnsCacheTTLSuccess),
 			})
 		}
-		keepCtx = true
-		return ctx, ips[0], nil
+		return parent, ips[0], nil
 	}
 
 	var lastErr error
 
 	for _, srv := range r.servers {
 		ip, err := func() (net.IP, error) {
-			childCtx, cancelChild := context.WithTimeout(ctx, timeOutResolve)
+			childCtx, cancelChild := context.WithTimeout(resolveCtx, timeOutResolve)
 			defer cancelChild()
 
 			if strings.HasPrefix(srv, "https://") {
@@ -313,8 +311,7 @@ func (r *DNSResolver) resolveInternal(parent context.Context, name string,
 					expiresAt: time.Now().Add(dnsCacheTTLSuccess),
 				})
 			}
-			keepCtx = true
-			return ctx, ip, nil
+			return parent, ip, nil
 		}
 		lastErr = err
 	}
@@ -327,7 +324,7 @@ func (r *DNSResolver) resolveInternal(parent context.Context, name string,
 			expiresAt: time.Now().Add(dnsCacheTTLNegative),
 		})
 	}
-	return ctx, nil, lastErr
+	return parent, nil, lastErr
 }
 
 func NewDNSResolver(servers []string, v6 bool, dial func(ctx context.Context, netw, addr string) (net.Conn, error)) *DNSResolver {

@@ -11,11 +11,10 @@ import (
 
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-func New(user, pass, host, port, keyPath string) (*Reconnector, DialFunc, error) {
+func New(user, pass, host, port, keyPath string, resolver HostResolver, opts ReconnectorOptions) (*Reconnector, DialFunc, error) {
 	cfg := buildConfig(user, pass, keyPath)
-	addr := net.JoinHostPort(host, port)
 
-	reConnector, err := NewReconnector(addr, cfg)
+	reConnector, err := NewReconnector(host, port, cfg, resolver, opts)
 	if err != nil {
 		return nil, nil, err
 	}

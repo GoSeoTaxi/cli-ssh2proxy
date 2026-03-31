@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
@@ -12,14 +13,22 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/limits"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/sshclient"
 )
 
 const (
-	lifeMax = 60 * time.Minute
+	lifeMax               = 60 * time.Minute
+	readHeaderTimeoutHTTP = 10 * time.Second
+	idleTimeoutHTTP       = 60 * time.Second
 )
 
-func NewHTTP(listen, user, pass string, dial sshclient.DialFunc) (*http.Server, error) {
+type HTTPServer struct {
+	srv   *http.Server
+	errCh chan error
+}
+
+func NewHTTP(listen, user, pass string, dial sshclient.DialFunc, sessions *limits.SessionLimiter, handshakes *limits.IPRateLimiter) (*HTTPServer, error) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if user != "" || pass != "" {
 			if !checkProxyAuth(r, user, pass) {
@@ -34,11 +43,22 @@ func NewHTTP(listen, user, pass string, dial sshclient.DialFunc) (*http.Server, 
 		}
 		dst, err := dial(r.Context(), "tcp", r.Host)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			zap.L().Warn("http_connect_dial_failed", zap.String("host", r.Host), zap.Error(err))
+			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		hj, _ := w.(http.Hijacker)
-		src, _, _ := hj.Hijack()
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			_ = dst.Close()
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		src, _, err := hj.Hijack()
+		if err != nil {
+			_ = dst.Close()
+			http.Error(w, "failed to hijack connection", http.StatusInternalServerError)
+			return
+		}
 		_, _ = io.WriteString(src, "HTTP/1.1 200 OK\r\n\r\n")
 		go copyBoth(dst, src)
 	})
@@ -46,15 +66,46 @@ func NewHTTP(listen, user, pass string, dial sshclient.DialFunc) (*http.Server, 
 	if err != nil {
 		return nil, err
 	}
+	ln = limits.WrapListener(ln, limits.ListenerOptions{
+		Protocol:        "http",
+		SessionLimiter:  sessions,
+		RateLimiter:     handshakes,
+		OverLimitAction: limits.RejectHTTP503,
+		RateLimitAction: limits.RejectHTTP429,
+	})
 
-	srv := &http.Server{Addr: listen, Handler: h}
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           h,
+		ReadHeaderTimeout: readHeaderTimeoutHTTP,
+		IdleTimeout:       idleTimeoutHTTP,
+	}
+	hs := &HTTPServer{
+		srv:   srv,
+		errCh: make(chan error, 1),
+	}
 	go func() {
+		defer close(hs.errCh)
 		zap.L().Info("HTTP proxy listening on", zap.String("listen", listen))
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			zap.L().Fatal("HTTP proxy Serve error", zap.Error(err))
+		if err := srv.Serve(ln); !isHTTPServeExit(err) {
+			hs.errCh <- err
 		}
 	}()
-	return srv, nil
+	return hs, nil
+}
+
+func (s *HTTPServer) Shutdown(ctx context.Context) error {
+	if s == nil || s.srv == nil {
+		return nil
+	}
+	return s.srv.Shutdown(ctx)
+}
+
+func (s *HTTPServer) Errors() <-chan error {
+	if s == nil {
+		return nil
+	}
+	return s.errCh
 }
 
 func checkProxyAuth(r *http.Request, user, pass string) bool {
@@ -93,4 +144,8 @@ func copyBoth(a, b net.Conn) {
 	case <-done:
 	case <-time.After(lifeMax):
 	}
+}
+
+func isHTTPServeExit(err error) bool {
+	return err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed)
 }

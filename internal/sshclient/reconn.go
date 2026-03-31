@@ -16,45 +16,106 @@ import (
 const (
 	timeOutBackoff          = 1100 * time.Millisecond
 	countAttemptsDial       = 3
-	timeOutWaitSlot         = 20 * time.Millisecond
 	slotTimeOutHardWaitSlot = 2 * time.Second
 	sshConnTimeout          = 5 * time.Second
 )
 
+var ErrReconnectorClosed = errors.New("ssh: reconnector closed")
+
+type HostResolver func(ctx context.Context, host string) (net.IP, error)
+
+type ReconnectorOptions struct {
+	MaxChannels int64
+	EnableProbe bool
+}
+
 type Reconnector struct {
-	addr string
-	cfg  *ssh.ClientConfig
+	host    string
+	port    string
+	cfg     *ssh.ClientConfig
+	resolve HostResolver
+	ctx     context.Context
+	cancel  context.CancelFunc
 
 	mu       sync.RWMutex
 	client   *ssh.Client
 	chanCnt  int64
 	maxChans int64
+	slotSem  chan struct{}
+	probeOn  bool
 
 	reconFlag int32
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
-func NewReconnector(addr string, cfg *ssh.ClientConfig) (*Reconnector, error) {
-	cl, err := ssh.Dial("tcp", addr, cfg)
+func NewReconnector(host, port string, cfg *ssh.ClientConfig, resolver HostResolver, opts ReconnectorOptions) (*Reconnector, error) {
+	if resolver == nil {
+		resolver = defaultHostResolver
+	}
+	maxChans := opts.MaxChannels
+	if maxChans < 0 {
+		maxChans = 0
+	}
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
+
+	r := &Reconnector{
+		host:     host,
+		port:     port,
+		cfg:      cfg,
+		resolve:  resolver,
+		ctx:      lifecycleCtx,
+		cancel:   cancel,
+		maxChans: maxChans,
+		probeOn:  opts.EnableProbe,
+	}
+	r.resetSlotSemaphore()
+
+	cl, resolvedAddr, err := r.connect(r.ctx)
 	if err != nil {
-		zap.L().Warn("ssh_up_err", zap.String("addr", addr), zap.Error(err))
+		cancel()
+		zap.L().Warn("ssh_up_err",
+			zap.String("target", r.target()),
+			zap.String("resolved_addr", resolvedAddr),
+			zap.Error(err),
+		)
 		return nil, err
 	}
-
-	r := &Reconnector{addr: addr, cfg: cfg, client: cl}
+	r.client = cl
 	r.startConnMonitor()
 
-	r.maxChans = probeMaxChannels(cl)
+	r.logProbeResult(cl, "ssh_up_probe")
 
-	zap.L().Info("ssh_up", zap.String("addr", addr), zap.Int64("max_channels", r.maxChans))
+	zap.L().Info("ssh_up",
+		zap.String("target", r.target()),
+		zap.String("resolved_addr", resolvedAddr),
+		zap.Int64("max_channels", r.maxChans),
+		zap.Bool("probe_enabled", r.probeOn),
+	)
 	return r, nil
 }
 
 func (r *Reconnector) Dial(ctx context.Context, n, a string) (net.Conn, error) {
-	if err := r.waitForSlot(ctx); err != nil {
+	if err := r.lifecycleErr(); err != nil {
 		return nil, err
 	}
 
+	slotSem, err := r.waitForSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			releaseSlot(slotSem)
+		}
+	}()
+
 	for i := 0; i < countAttemptsDial; i++ {
+		if err := r.lifecycleErr(); err != nil {
+			return nil, err
+		}
+
 		r.mu.RLock()
 		cl := r.client
 		r.mu.RUnlock()
@@ -69,7 +130,8 @@ func (r *Reconnector) Dial(ctx context.Context, n, a string) (net.Conn, error) {
 		conn, err := cl.Dial(n, a)
 		if err == nil {
 			atomic.AddInt64(&r.chanCnt, 1)
-			return &channelConn{Conn: conn, rec: r}, nil
+			slotHeld = false
+			return &channelConn{Conn: conn, rec: r, slotSem: slotSem}, nil
 		}
 
 		if ocErr, ok := err.(*ssh.OpenChannelError); ok {
@@ -82,10 +144,11 @@ func (r *Reconnector) Dial(ctx context.Context, n, a string) (net.Conn, error) {
 		}
 
 		if isNetErr(err) {
-			if r.reconnect() == nil {
+			recErr := r.reconnect()
+			if recErr == nil {
 				continue
 			}
-			return nil, err
+			return nil, recErr
 		}
 
 		return nil, err
@@ -94,19 +157,40 @@ func (r *Reconnector) Dial(ctx context.Context, n, a string) (net.Conn, error) {
 }
 
 func (r *Reconnector) Close() {
-	r.mu.Lock()
-	if r.client != nil {
-		_ = r.client.Close()
-		r.client = nil
-		zap.L().Info("ssh_down", zap.String("addr", r.addr))
-	}
-	r.mu.Unlock()
+	r.closeOnce.Do(func() {
+		r.cancel()
+
+		r.mu.Lock()
+		if r.client != nil {
+			_ = r.client.Close()
+			r.client = nil
+			zap.L().Info("ssh_down", zap.String("target", r.target()))
+		}
+		r.resetSlotSemaphore()
+		r.mu.Unlock()
+
+		r.wg.Wait()
+	})
 }
 
 func (r *Reconnector) reconnect() error {
+	if err := r.lifecycleErr(); err != nil {
+		return err
+	}
+
 	if !atomic.CompareAndSwapInt32(&r.reconFlag, 0, 1) {
+		t := time.NewTicker(10 * time.Millisecond)
+		defer t.Stop()
+
 		for atomic.LoadInt32(&r.reconFlag) == 1 {
-			time.Sleep(10 * time.Millisecond)
+			select {
+			case <-r.ctx.Done():
+				return ErrReconnectorClosed
+			case <-t.C:
+			}
+		}
+		if err := r.lifecycleErr(); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -116,47 +200,139 @@ func (r *Reconnector) reconnect() error {
 	if r.client != nil {
 		_ = r.client.Close()
 		r.client = nil
-		zap.L().Info("ssh_down", zap.String("addr", r.addr))
+		zap.L().Info("ssh_down", zap.String("target", r.target()))
 	}
 	r.mu.Unlock()
 
 	backoff := timeOutBackoff
 	for attempt := 0; attempt < countAttemptsDial; attempt++ {
-		d := net.Dialer{Timeout: sshConnTimeout}
-		raw, err := d.Dial("tcp", r.addr)
+		if err := r.lifecycleErr(); err != nil {
+			return err
+		}
 
+		cl, resolvedAddr, err := r.connect(r.ctx)
 		if err != nil {
-			zap.L().Warn("ssh_reconnect_err", zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
+			if r.ctx.Err() != nil {
+				return ErrReconnectorClosed
+			}
 
-			time.Sleep(backoff)
+			zap.L().Warn("ssh_reconnect_err",
+				zap.String("target", r.target()),
+				zap.String("resolved_addr", resolvedAddr),
+				zap.Int("attempt", attempt+1),
+				zap.Duration("backoff", backoff),
+				zap.Error(err),
+			)
+
+			t := time.NewTimer(backoff)
+			select {
+			case <-r.ctx.Done():
+				t.Stop()
+				return ErrReconnectorClosed
+			case <-t.C:
+			}
 			backoff *= 2
 			continue
 		}
-
-		cc, chans, reqs, err := ssh.NewClientConn(raw, r.addr, r.cfg)
-		if err != nil {
-			_ = raw.Close()
-			zap.L().Warn("ssh_reconnect_err", zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
-
-			time.Sleep(backoff)
-			backoff *= 2
-			continue
-		}
-		cl := ssh.NewClient(cc, chans, reqs)
 
 		r.mu.Lock()
+		if r.ctx.Err() != nil {
+			r.mu.Unlock()
+			_ = cl.Close()
+			return ErrReconnectorClosed
+		}
 		r.client = cl
+		r.resetSlotSemaphore()
 		r.mu.Unlock()
 
-		r.maxChans = probeMaxChannels(cl)
+		r.logProbeResult(cl, "ssh_reconnect_probe")
 
 		atomic.StoreInt64(&r.chanCnt, 0)
 
-		zap.L().Info("ssh_reconnect_ok", zap.Int("attempt", attempt+1), zap.Duration("backoff_used", backoff/2), zap.Int64("max_channels", r.maxChans))
+		zap.L().Info("ssh_reconnect_ok",
+			zap.String("target", r.target()),
+			zap.String("resolved_addr", resolvedAddr),
+			zap.Int("attempt", attempt+1),
+			zap.Duration("backoff_used", backoff/2),
+			zap.Int64("max_channels", r.maxChans),
+		)
 		return nil
 	}
-	zap.L().Error("ssh_reconnect_failed", zap.String("addr", r.addr), zap.Int("attempts", countAttemptsDial))
+	if r.ctx.Err() != nil {
+		return ErrReconnectorClosed
+	}
+	zap.L().Error("ssh_reconnect_failed", zap.String("target", r.target()), zap.Int("attempts", countAttemptsDial))
 	return errors.New("ssh: retries exceeded")
+}
+
+func (r *Reconnector) connect(ctx context.Context) (*ssh.Client, string, error) {
+	connectCtx, cancel := context.WithTimeout(ctx, sshConnTimeout)
+	defer cancel()
+
+	addr, err := r.resolveAddr(connectCtx)
+	if err != nil {
+		return nil, "", err
+	}
+	cl, err := dialSSH(connectCtx, addr, r.cfg)
+	if err != nil {
+		return nil, addr, err
+	}
+	return cl, addr, nil
+}
+
+func dialSSH(ctx context.Context, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	d := net.Dialer{Timeout: sshConnTimeout}
+	raw, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	_ = raw.SetDeadline(time.Now().Add(sshConnTimeout))
+	cc, chans, reqs, err := ssh.NewClientConn(raw, addr, cfg)
+	_ = raw.SetDeadline(time.Time{})
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return ssh.NewClient(cc, chans, reqs), nil
+}
+
+func (r *Reconnector) resolveAddr(ctx context.Context) (string, error) {
+	if ip := net.ParseIP(r.host); ip != nil {
+		return net.JoinHostPort(ip.String(), r.port), nil
+	}
+	ip, err := r.resolve(ctx, r.host)
+	if err != nil {
+		return "", err
+	}
+	if ip == nil {
+		return "", errors.New("ssh: resolver returned nil IP")
+	}
+	return net.JoinHostPort(ip.String(), r.port), nil
+}
+
+func defaultHostResolver(ctx context.Context, host string) (net.IP, error) {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("ssh: hostname resolved to empty list")
+	}
+	return ips[0], nil
+}
+
+func (r *Reconnector) target() string {
+	return net.JoinHostPort(r.host, r.port)
+}
+
+func (r *Reconnector) logProbeResult(cl *ssh.Client, event string) {
+	if !r.probeOn {
+		return
+	}
+	zap.L().Info(event,
+		zap.String("target", r.target()),
+		zap.Int64("probe_limit", probeMaxChannels(cl)),
+	)
 }
 
 func isNetErr(err error) bool {
@@ -169,13 +345,15 @@ func isNetErr(err error) bool {
 
 type channelConn struct {
 	net.Conn
-	rec    *Reconnector
-	closed uint32
+	rec     *Reconnector
+	slotSem chan struct{}
+	closed  uint32
 }
 
 func (c *channelConn) Close() error {
 	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
-		atomic.AddInt64(&c.rec.chanCnt, -1)
+		decrementIfPositive(&c.rec.chanCnt)
+		releaseSlot(c.slotSem)
 	}
 	return c.Conn.Close()
 }
@@ -184,23 +362,66 @@ func (r *Reconnector) Channels() int64 {
 	return atomic.LoadInt64(&r.chanCnt)
 }
 
-func (r *Reconnector) waitForSlot(ctx context.Context) error {
-	if r.maxChans == 0 {
-		return nil
+func (r *Reconnector) waitForSlot(ctx context.Context) (chan struct{}, error) {
+	if err := r.lifecycleErr(); err != nil {
+		return nil, err
 	}
+
+	r.mu.RLock()
+	sem := r.slotSem
+	r.mu.RUnlock()
+	if sem == nil {
+		return nil, nil
+	}
+
 	deadline := time.NewTimer(slotTimeOutHardWaitSlot)
 	defer deadline.Stop()
 
+	select {
+	case sem <- struct{}{}:
+		return sem, nil
+	case <-r.ctx.Done():
+		return nil, ErrReconnectorClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-deadline.C:
+		return nil, errors.New("ssh: slot wait timeout")
+	}
+}
+
+func (r *Reconnector) lifecycleErr() error {
+	if r.ctx.Err() != nil {
+		return ErrReconnectorClosed
+	}
+	return nil
+}
+
+func releaseSlot(sem chan struct{}) {
+	if sem == nil {
+		return
+	}
+	select {
+	case <-sem:
+	default:
+	}
+}
+
+func (r *Reconnector) resetSlotSemaphore() {
+	if r.maxChans <= 0 {
+		r.slotSem = nil
+		return
+	}
+	r.slotSem = make(chan struct{}, int(r.maxChans))
+}
+
+func decrementIfPositive(counter *int64) {
 	for {
-		if atomic.LoadInt64(&r.chanCnt) < r.maxChans {
-			return nil
+		cur := atomic.LoadInt64(counter)
+		if cur <= 0 {
+			return
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return errors.New("ssh: slot wait timeout")
-		case <-time.After(timeOutWaitSlot):
+		if atomic.CompareAndSwapInt64(counter, cur, cur-1) {
+			return
 		}
 	}
 }

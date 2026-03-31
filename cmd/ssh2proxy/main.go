@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/config"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/forward"
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/limits"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/logger"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/metrics"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/proxy"
@@ -33,8 +34,20 @@ const (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config load error: %v\n", err)
+		os.Exit(1)
+	}
 	logger.Init(cfg.Debug)
+
+	if err := run(cfg); err != nil {
+		zap.L().Error("shutdown with error", zap.Error(err))
+		os.Exit(1)
+	}
+}
+
+func run(cfg *config.Config) error {
 	logDotEnv()
 
 	bootDNS := proxy.NewDNSResolver(cfg.DNSServers, cfg.DNSv6, nil)
@@ -45,27 +58,33 @@ func main() {
 		err   error
 	)
 
-	serverAddr := cfg.Server
 	if ip := net.ParseIP(cfg.Server); ip != nil {
-		serverAddr = ip.String()
-		zap.L().Debug("bootstrap DNS skipped: server is IP", zap.String("server", serverAddr))
+		zap.L().Debug("bootstrap DNS skipped: server is IP", zap.String("server", ip.String()))
 	}
-	for {
-		if net.ParseIP(serverAddr) == nil {
-			_, ip, err := bootDNS.ResolveBoot(context.Background(), serverAddr)
-			if err != nil {
-				zap.L().Info("bootstrap DNS failed", zap.Error(err))
-				time.Sleep(sleepToReconnect)
-				continue
-			}
-			serverAddr = ip.String()
-		}
 
-		sshCl, dial, err = sshclient.New(cfg.Login, cfg.Password, serverAddr, cfg.Port, cfg.KeyPath)
+	resolveServer := func(ctx context.Context, host string) (net.IP, error) {
+		_, ip, err := bootDNS.ResolveBoot(ctx, host)
+		return ip, err
+	}
+	sshReconnectOpts := sshclient.ReconnectorOptions{
+		MaxChannels: cfg.SSHMaxChannels,
+		EnableProbe: cfg.SSHProbeMaxChannels,
+	}
+
+	for {
+		sshCl, dial, err = sshclient.New(
+			cfg.Login,
+			cfg.Password,
+			cfg.Server,
+			cfg.Port,
+			cfg.KeyPath,
+			resolveServer,
+			sshReconnectOpts,
+		)
 		if err == nil {
 			break
 		}
-		zap.L().Info("SSH connect failed", zap.Error(err), zap.String("sleep", "10s"))
+		zap.L().Info("SSH connect failed", zap.Error(err), zap.Duration("sleep", sleepToReconnect))
 		time.Sleep(sleepToReconnect)
 	}
 	defer sshCl.Close()
@@ -87,26 +106,39 @@ func main() {
 		return metrics.NewTrackConn(&metrics.CountConn{Conn: metrics.NewIdleConn(raw, timeOutIdleConnection)}), nil
 	}
 
+	sessionLimiter := limits.NewSessionLimiter(cfg.MaxClientConns)
+	handshakeLimiter := limits.NewIPRateLimiter(
+		cfg.HandshakeRPS,
+		cfg.HandshakeBurst,
+		time.Duration(cfg.HandshakeIPTTLSec)*time.Second,
+	)
+	zap.L().Info("client_admission_limits",
+		zap.Int64("max_client_conns", cfg.MaxClientConns),
+		zap.Int64("handshake_rps", cfg.HandshakeRPS),
+		zap.Int64("handshake_burst", cfg.HandshakeBurst),
+		zap.Int64("handshake_ip_ttl_sec", cfg.HandshakeIPTTLSec),
+	)
+
 	var fwd *forward.TCPForwarder
-	fwd, err = forward.StartTCP(cfg.UDPGWLocal, cfg.UDPGWRemote, dialCount)
+	fwd, err = forward.StartTCP(cfg.UDPGWLocal, cfg.UDPGWRemote, dialCount, sessionLimiter)
 	if err != nil {
-		zap.L().Fatal("udpgw forward", zap.Error(err))
+		return fmt.Errorf("udpgw forward: %w", err)
 	}
 	defer fwd.Close()
 
-	var httpSrv *http.Server
+	var httpSrv *proxy.HTTPServer
 	if cfg.HTTPL != "" {
-		httpSrv, err = proxy.NewHTTP(cfg.HTTPL, cfg.HTTPUser, cfg.HTTPPass, dialCount)
+		httpSrv, err = proxy.NewHTTP(cfg.HTTPL, cfg.HTTPUser, cfg.HTTPPass, dialCount, sessionLimiter, handshakeLimiter)
 		if err != nil {
-			zap.L().Fatal("HTTP", zap.Error(err))
+			return fmt.Errorf("HTTP: %w", err)
 		}
 	}
 
 	var socksSrv *proxy.SocksServer
 	if cfg.SocksL != "" {
-		socksSrv, err = proxy.NewSOCKS(cfg, dialCount)
+		socksSrv, err = proxy.NewSOCKS(cfg, dialCount, sessionLimiter, handshakeLimiter)
 		if err != nil {
-			zap.L().Fatal("SOCKS", zap.Error(err))
+			return fmt.Errorf("SOCKS: %w", err)
 		}
 	}
 
@@ -118,7 +150,7 @@ func main() {
 		}
 		cmdTun, err = tun.RunExternal(proxyAddr)
 		if err != nil {
-			zap.L().Fatal("tun2socks external", zap.Error(err))
+			return fmt.Errorf("tun2socks external: %w", err)
 		}
 	}
 
@@ -144,22 +176,61 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
-	zap.L().Info("shutting down…")
+	defer signal.Stop(sig)
 
+	httpErrCh := (<-chan error)(nil)
+	if httpSrv != nil {
+		httpErrCh = httpSrv.Errors()
+	}
+	socksErrCh := (<-chan error)(nil)
+	if socksSrv != nil {
+		socksErrCh = socksSrv.Errors()
+	}
+
+	var runtimeErr error
+	for {
+		select {
+		case <-sig:
+			zap.L().Info("shutting down…", zap.String("reason", "signal"))
+			goto shutdown
+		case err, ok := <-httpErrCh:
+			if !ok {
+				httpErrCh = nil
+				continue
+			}
+			runtimeErr = fmt.Errorf("HTTP proxy Serve error: %w", err)
+			zap.L().Error("shutting down on runtime error", zap.Error(runtimeErr))
+			goto shutdown
+		case err, ok := <-socksErrCh:
+			if !ok {
+				socksErrCh = nil
+				continue
+			}
+			runtimeErr = fmt.Errorf("SOCKS5 proxy Serve error: %w", err)
+			zap.L().Error("shutting down on runtime error", zap.Error(runtimeErr))
+			goto shutdown
+		}
+	}
+
+shutdown:
 	ctx, cancel := context.WithTimeout(context.Background(), timeCloser)
 	defer cancel()
 
 	if httpSrv != nil {
-		_ = httpSrv.Shutdown(ctx)
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			zap.L().Warn("HTTP shutdown error", zap.Error(err))
+		}
 	}
 	if socksSrv != nil {
-		_ = socksSrv.Shutdown(ctx)
+		if err := socksSrv.Shutdown(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
+			zap.L().Warn("SOCKS shutdown error", zap.Error(err))
+		}
 	}
 	if cmdTun != nil && cmdTun.Process != nil {
 		_ = cmdTun.Process.Kill()
 	}
 
+	return runtimeErr
 }
 
 func logDotEnv() {
