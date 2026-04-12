@@ -106,11 +106,11 @@ Each archive is a **single self-contained executable**—no extra libraries requ
 
 | OS&nbsp;/&nbsp;Arch      | File name                          | Size (≈) | SHA-256 checksum |
 |--------------------------|------------------------------------|----------|------------------|
-| Linux x86-64             | `ssh2proxy-linux_amd64`            | 25 MB | `9cbba5e8b1fa58266d235f214f29abcbd71f7015264f60a89a8f1fb1e6e81cbc` |
-| Linux ARM64 (aarch64)    | `ssh2proxy-linux_arm64`            | 25 MB | `45bd53f24a78b15ea1e03a0a2e9cddbf8b66780c0f2c64fbc55af86bafdd6a7e` |
-| macOS Intel (x86-64)     | `ssh2proxy-darwin_amd64`           | 25 MB | `e6fb8b70fd02fcd38569ceb9fb5ac7550d43cff40d80d6728ad186b4ec9329a3` |
-| macOS Apple Silicon      | `ssh2proxy-darwin_arm64`           | 24 MB | `c41b9d68b624555bc6d03b147eb456a1c2987e317b31f6405e0117510f219da6` |
-| Windows x86-64           | `ssh2proxy-windows_amd64.exe`      | 27 MB | `fced9ce6369cba54bbc11aee88326aa0a0f71e2a52b86d7aeedfa7ac0e6c6b7c` |
+| Linux x86-64             | `ssh2proxy-linux_amd64`            | 26 MB | `7b5ae0f9b3ad6be5ced5506288425b17946204d5c93a38f6c9ea99424e466d2d` |
+| Linux ARM64 (aarch64)    | `ssh2proxy-linux_arm64`            | 25 MB | `5b770fa3ba5d987b108b61b5a2eff732bf28847967332302ded3d76f5ba5a633` |
+| macOS Intel (x86-64)     | `ssh2proxy-darwin_amd64`           | 26 MB | `7046f0e64ad3324129532ef836ee5940c1828fdcd114f3d91e69bd9d8e264842` |
+| macOS Apple Silicon      | `ssh2proxy-darwin_arm64`           | 25 MB | `6b1fdad0bd5ff93e3fb16b29775a94364dd858c32d15249b7a1ef45b8142430a` |
+| Windows x86-64           | `ssh2proxy-windows_amd64.exe`      | 27 MB | `8ebc686845696ea5101bd1a5557955412585b9cbe1c41415c70d1bd3398e76f2` |
 
 > ⚠️ The **TUN / full-tunnel** mode ships experimental `tun2socks` helpers embedded inside each build.  
 > If you only need SOCKS5/HTTP proxying you can ignore them.
