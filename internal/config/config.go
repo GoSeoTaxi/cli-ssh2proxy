@@ -42,10 +42,16 @@ type Config struct {
 	HandshakeRPS         int64
 	HandshakeBurst       int64
 	HandshakeIPTTLSec    int64
+	AutoUpdate           bool
+	AutoUpdateAllowPre   bool
+	AutoUpdateInterval   time.Duration
+	AutoUpdateTimeout    time.Duration
 
 	UDPGWRemote string
 	UDPGWLocal  string
 }
+
+const defaultCapacityLimit int64 = 512
 
 func Load() (*Config, error) {
 	_ = godotenv.Load()
@@ -66,25 +72,35 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	sshMaxChannels, err := getEnvInt("SSH_MAX_CHANNELS", 64)
+	sshMaxChannels, sshMaxChannelsExplicit, err := getOptionalEnvInt("SSH_MAX_CHANNELS")
 	if err != nil {
 		return nil, err
 	}
-	if sshMaxChannels < 0 {
+	if sshMaxChannelsExplicit && sshMaxChannels < 0 {
 		return nil, fmt.Errorf("invalid SSH_MAX_CHANNELS: must be >= 0")
 	}
 	sshProbeMaxChannels, err := getEnvBool("SSH_PROBE_MAX_CHANNELS", false)
 	if err != nil {
 		return nil, err
 	}
-	maxClientConns := int64(0)
-	maxClientConnsExplicit := false
-	if raw, ok := os.LookupEnv("MAX_CLIENT_CONNS"); ok && strings.TrimSpace(raw) != "" {
-		maxClientConns, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid MAX_CLIENT_CONNS: %v", err)
+	maxClientConns, maxClientConnsExplicit, err := getOptionalEnvInt("MAX_CLIENT_CONNS")
+	if err != nil {
+		return nil, err
+	}
+	if maxClientConnsExplicit && maxClientConns < 0 {
+		return nil, fmt.Errorf("invalid MAX_CLIENT_CONNS: must be >= 0")
+	}
+
+	capacityLimit := defaultCapacityLimit
+	switch {
+	case maxClientConnsExplicit:
+		capacityLimit = maxClientConns
+		if sshMaxChannelsExplicit && sshMaxChannels != maxClientConns {
+			logConfigWarning("MAX_CLIENT_CONNS=%d overrides SSH_MAX_CHANNELS=%d; using %d for both limits", maxClientConns, sshMaxChannels, maxClientConns)
 		}
-		maxClientConnsExplicit = true
+	case sshMaxChannelsExplicit:
+		capacityLimit = sshMaxChannels
+		logConfigWarning("SSH_MAX_CHANNELS is deprecated, use MAX_CLIENT_CONNS; using %d for both limits", sshMaxChannels)
 	}
 	handshakeRPS, err := getEnvInt("HANDSHAKE_RPS", 100)
 	if err != nil {
@@ -107,6 +123,28 @@ func Load() (*Config, error) {
 	if handshakeIPTTLSec < 0 {
 		return nil, fmt.Errorf("invalid HANDSHAKE_IP_TTL_SEC: must be >= 0")
 	}
+	autoUpdate, err := getEnvBool("AUTO_UPDATE", false)
+	if err != nil {
+		return nil, err
+	}
+	autoUpdateAllowPre, err := getEnvBool("AUTO_UPDATE_ALLOW_PRERELEASE", false)
+	if err != nil {
+		return nil, err
+	}
+	autoUpdateCheckIntervalSec, err := getEnvInt("AUTO_UPDATE_CHECK_INTERVAL_SEC", 0)
+	if err != nil {
+		return nil, err
+	}
+	if autoUpdateCheckIntervalSec < 0 {
+		return nil, fmt.Errorf("invalid AUTO_UPDATE_CHECK_INTERVAL_SEC: must be >= 0")
+	}
+	autoUpdateTimeoutSec, err := getEnvInt("AUTO_UPDATE_TIMEOUT_SEC", 15)
+	if err != nil {
+		return nil, err
+	}
+	if autoUpdateTimeoutSec <= 0 {
+		return nil, fmt.Errorf("invalid AUTO_UPDATE_TIMEOUT_SEC: must be > 0")
+	}
 
 	cfg := &Config{
 
@@ -126,12 +164,16 @@ func Load() (*Config, error) {
 		TimeOutMonitorIntSec: timeOutMonitorIntSec,
 		Debug:                debug,
 		DNSProvider:          getEnv("DNS_PROVIDER", ""),
-		SSHMaxChannels:       sshMaxChannels,
+		SSHMaxChannels:       capacityLimit,
 		SSHProbeMaxChannels:  sshProbeMaxChannels,
-		MaxClientConns:       maxClientConns,
+		MaxClientConns:       capacityLimit,
 		HandshakeRPS:         handshakeRPS,
 		HandshakeBurst:       handshakeBurst,
 		HandshakeIPTTLSec:    handshakeIPTTLSec,
+		AutoUpdate:           autoUpdate,
+		AutoUpdateAllowPre:   autoUpdateAllowPre,
+		AutoUpdateInterval:   time.Duration(autoUpdateCheckIntervalSec) * time.Second,
+		AutoUpdateTimeout:    time.Duration(autoUpdateTimeoutSec) * time.Second,
 
 		UDPGWRemote: getEnv("UDPGW_REMOTE", "127.0.0.1:7300"),
 		UDPGWLocal:  getEnv("UDPGW_LOCAL", "127.0.0.1:7300"),
@@ -164,19 +206,28 @@ func Load() (*Config, error) {
 	flag.BoolVar(&cfg.DNSv6, "dnsv6", cfg.DNSv6, "Resolve AAAA records too")
 
 	flag.StringVar(&cfg.DNSProvider, "dns-provider", cfg.DNSProvider, "DNS provider: DOH_GOOGLE, DOH_CF, DNS_QUERY, DIRECT")
-	flag.Int64Var(&cfg.SSHMaxChannels, "ssh-max-channels", cfg.SSHMaxChannels, "Max simultaneously opened SSH channels (0 disables limit)")
+	flag.Int64Var(&cfg.SSHMaxChannels, "ssh-max-channels", cfg.SSHMaxChannels, "Deprecated: use --max-client-conns (shared capacity limit, 0 disables limit)")
 	flag.BoolVar(&cfg.SSHProbeMaxChannels, "ssh-probe-max-channels", cfg.SSHProbeMaxChannels, "Run aggressive max-channels probe (diagnostic only)")
-	flag.Int64Var(&cfg.MaxClientConns, "max-client-conns", cfg.MaxClientConns, "Max simultaneously accepted client connections across HTTP/SOCKS/TCP listeners (0 disables limit)")
+	flag.Int64Var(&cfg.MaxClientConns, "max-client-conns", cfg.MaxClientConns, "Shared capacity limit for client admission and SSH channels (0 disables limit)")
 	flag.Int64Var(&cfg.HandshakeRPS, "handshake-rps", cfg.HandshakeRPS, "Per-IP handshake token refill rate per second for HTTP/SOCKS (0 disables)")
 	flag.Int64Var(&cfg.HandshakeBurst, "handshake-burst", cfg.HandshakeBurst, "Per-IP handshake token bucket size for HTTP/SOCKS")
 	flag.Int64Var(&cfg.HandshakeIPTTLSec, "handshake-ip-ttl-sec", cfg.HandshakeIPTTLSec, "Idle TTL in seconds for per-IP handshake buckets")
+	flag.BoolVar(&cfg.AutoUpdate, "auto-update", cfg.AutoUpdate, "Enable startup auto-update checks and installation")
+	flag.BoolVar(&cfg.AutoUpdateAllowPre, "auto-update-allow-prerelease", cfg.AutoUpdateAllowPre, "Allow prerelease versions when checking for updates")
+	flag.DurationVar(&cfg.AutoUpdateInterval, "auto-update-check-interval", cfg.AutoUpdateInterval, "Background auto-update check interval (0 = only at startup)")
+	flag.DurationVar(&cfg.AutoUpdateTimeout, "auto-update-timeout", cfg.AutoUpdateTimeout, "Auto-update HTTP timeout")
 
 	flag.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Debug")
 	flag.Parse()
 
+	maxClientConnsFlagExplicit := false
+	sshMaxChannelsFlagExplicit := false
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "max-client-conns" {
-			maxClientConnsExplicit = true
+		switch f.Name {
+		case "max-client-conns":
+			maxClientConnsFlagExplicit = true
+		case "ssh-max-channels":
+			sshMaxChannelsFlagExplicit = true
 		}
 	})
 
@@ -195,9 +246,26 @@ func Load() (*Config, error) {
 	if cfg.HandshakeIPTTLSec < 0 {
 		return nil, fmt.Errorf("handshake-ip-ttl-sec must be >= 0")
 	}
-	if !maxClientConnsExplicit {
-		cfg.MaxClientConns = cfg.SSHMaxChannels
+	if cfg.AutoUpdateInterval < 0 {
+		return nil, fmt.Errorf("auto-update-check-interval must be >= 0")
 	}
+	if cfg.AutoUpdateTimeout <= 0 {
+		return nil, fmt.Errorf("auto-update-timeout must be > 0")
+	}
+
+	resolvedCapacity := cfg.MaxClientConns
+	switch {
+	case maxClientConnsFlagExplicit:
+		resolvedCapacity = cfg.MaxClientConns
+		if sshMaxChannelsFlagExplicit && cfg.SSHMaxChannels != cfg.MaxClientConns {
+			logConfigWarning("--max-client-conns=%d overrides --ssh-max-channels=%d; using %d for both limits", cfg.MaxClientConns, cfg.SSHMaxChannels, cfg.MaxClientConns)
+		}
+	case sshMaxChannelsFlagExplicit:
+		resolvedCapacity = cfg.SSHMaxChannels
+		logConfigWarning("--ssh-max-channels is deprecated, use --max-client-conns; using %d for both limits", cfg.SSHMaxChannels)
+	}
+	cfg.MaxClientConns = resolvedCapacity
+	cfg.SSHMaxChannels = resolvedCapacity
 
 	cfg.SocksL, cfg.SocksUser, cfg.SocksPass, err = parseListenAddr(cfg.SocksL, "SOCKS_LSN")
 	if err != nil {
@@ -264,6 +332,22 @@ func getEnvInt(k string, def int64) (int64, error) {
 		return i, nil
 	}
 	return def, nil
+}
+
+func getOptionalEnvInt(k string) (int64, bool, error) {
+	raw, ok := os.LookupEnv(k)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return 0, false, nil
+	}
+	i, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid %s: %v", k, err)
+	}
+	return i, true, nil
+}
+
+func logConfigWarning(format string, args ...any) {
+	_, _ = fmt.Fprintf(os.Stderr, "config warning: "+format+"\n", args...)
 }
 
 func getEnvBool(k string, def bool) (bool, error) {

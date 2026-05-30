@@ -21,6 +21,7 @@ const (
 	dnsCacheMaxEntries    = 100000                // size cache
 	dnsCacheTTLSuccess    = 30 * 60 * time.Second // 30 minutes
 	dnsCacheTTLNegative   = 30 * time.Second      // 0.5 minutes
+	dnsCacheCleanupEvery  = 15 * time.Second
 )
 
 type dnsJSON struct {
@@ -75,12 +76,64 @@ type dnsCacheEntry struct {
 }
 
 type dnsCache struct {
-	mu    sync.RWMutex
-	items map[string]dnsCacheEntry
+	mu         sync.RWMutex
+	items      map[string]dnsCacheEntry
+	maxEntries int
+	stopOnce   sync.Once
+	stopCh     chan struct{}
+	stopped    chan struct{}
 }
 
 func newDNSCache() *dnsCache {
-	return &dnsCache{items: make(map[string]dnsCacheEntry, dnsCacheMaxEntries)}
+	return newDNSCacheWithConfig(dnsCacheMaxEntries, dnsCacheCleanupEvery)
+}
+
+func newDNSCacheWithConfig(maxEntries int, cleanupEvery time.Duration) *dnsCache {
+	if maxEntries <= 0 {
+		maxEntries = dnsCacheMaxEntries
+	}
+	c := &dnsCache{
+		items:      make(map[string]dnsCacheEntry, maxEntries),
+		maxEntries: maxEntries,
+	}
+	if cleanupEvery > 0 {
+		c.stopCh = make(chan struct{})
+		c.stopped = make(chan struct{})
+		go c.cleanupLoop(cleanupEvery)
+	}
+	return c
+}
+
+func (c *dnsCache) cleanupLoop(cleanupEvery time.Duration) {
+	t := time.NewTicker(cleanupEvery)
+	defer func() {
+		t.Stop()
+		close(c.stopped)
+	}()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-t.C:
+			c.cleanupExpired(time.Now())
+		}
+	}
+}
+
+func (c *dnsCache) cleanupExpired(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleteExpiredLocked(now)
+}
+
+func (c *dnsCache) Close() {
+	if c == nil || c.stopCh == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
+	<-c.stopped
 }
 
 func (c *dnsCache) Get(key string) (dnsCacheEntry, bool) {
@@ -91,9 +144,9 @@ func (c *dnsCache) Get(key string) (dnsCacheEntry, bool) {
 	if !ok {
 		return dnsCacheEntry{}, false
 	}
-	if now.After(entry.expiresAt) {
+	if !now.Before(entry.expiresAt) {
 		c.mu.Lock()
-		if cur, ok := c.items[key]; ok && now.After(cur.expiresAt) {
+		if cur, ok := c.items[key]; ok && !now.Before(cur.expiresAt) {
 			delete(c.items, key)
 		}
 		c.mu.Unlock()
@@ -105,15 +158,16 @@ func (c *dnsCache) Get(key string) (dnsCacheEntry, bool) {
 func (c *dnsCache) Set(key string, entry dnsCacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
 	if _, ok := c.items[key]; ok {
 		c.items[key] = entry
 		return
 	}
-	if len(c.items) >= dnsCacheMaxEntries {
-		for k := range c.items {
-			delete(c.items, k)
-			break
-		}
+	if len(c.items) >= c.maxEntries {
+		c.deleteExpiredLocked(now)
+	}
+	if len(c.items) >= c.maxEntries {
+		c.evictOldestLocked(len(c.items) - c.maxEntries + 1)
 	}
 	c.items[key] = entry
 }
@@ -122,6 +176,38 @@ func (c *dnsCache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.items)
+}
+
+func (c *dnsCache) deleteExpiredLocked(now time.Time) {
+	for k, v := range c.items {
+		if !now.Before(v.expiresAt) {
+			delete(c.items, k)
+		}
+	}
+}
+
+func (c *dnsCache) evictOldestLocked(count int) {
+	for i := 0; i < count; i++ {
+		k, ok := c.oldestKeyLocked()
+		if !ok {
+			return
+		}
+		delete(c.items, k)
+	}
+}
+
+func (c *dnsCache) oldestKeyLocked() (string, bool) {
+	var oldestKey string
+	var oldestExp time.Time
+	found := false
+	for k, v := range c.items {
+		if !found || v.expiresAt.Before(oldestExp) || (v.expiresAt.Equal(oldestExp) && k < oldestKey) {
+			oldestKey = k
+			oldestExp = v.expiresAt
+			found = true
+		}
+	}
+	return oldestKey, found
 }
 
 type DNSResolver struct {
@@ -137,6 +223,13 @@ func (r *DNSResolver) CacheLen() int {
 		return 0
 	}
 	return r.cache.Len()
+}
+
+func (r *DNSResolver) Close() {
+	if r == nil || r.cache == nil {
+		return
+	}
+	r.cache.Close()
 }
 
 func (r *DNSResolver) ResolveBoot(parent context.Context, name string) (context.Context, net.IP, error) {
@@ -328,6 +421,10 @@ func (r *DNSResolver) resolveInternal(parent context.Context, name string,
 }
 
 func NewDNSResolver(servers []string, v6 bool, dial func(ctx context.Context, netw, addr string) (net.Conn, error)) *DNSResolver {
+	if dial == nil {
+		dial = plainDial
+	}
+
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dial(ctx, network, addr)

@@ -1,5 +1,6 @@
 APP       := ssh2proxy
 MAIN_PKG  := ./cmd/ssh2proxy
+MODULE    := github.com/GoSeoTaxi/cli-ssh2proxy
 
 TUN_PKG   := github.com/xjasonlyu/tun2socks/v2
 TUN_VER   := v2.6.0
@@ -8,7 +9,16 @@ PLATFORMS := linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64
 
 DIST      := bin
 TUN_DIR   := internal/tun/bins
-GOFLAGS   := -trimpath -ldflags='-s -w'
+DIST_BINS := $(APP)-linux_amd64 $(APP)-linux_arm64 $(APP)-darwin_amd64 $(APP)-darwin_arm64 $(APP)-windows_amd64.exe
+CHECKSUMS_FILE := $(DIST)/checksums.txt
+VERSION   ?= dev
+COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS   := -s -w \
+	-X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
+	-X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
+	-X $(MODULE)/internal/buildinfo.BuildDate=$(BUILD_DATE)
+GOFLAGS   := -trimpath -ldflags='$(LDFLAGS)'
 
 BINROOT   := $(shell go env GOBIN)
 ifeq ($(strip $(BINROOT)),)
@@ -19,15 +29,15 @@ split = $(subst _, ,$1)
 os    = $(word 1,$(call split,$1))
 arch  = $(word 2,$(call split,$1))
 
-.PHONY: all app tun update-readme clean
+.PHONY: all app tun update-readme checksums release-artifacts clean
 all: tun app
 
-app: update-readme
+app: tun update-readme
 
 $(DIST)/$(APP)-%: | $(DIST)
 	$(eval OS   := $(call os,$*))
 	$(eval ARCH := $(call arch,$*))
-	$(eval OUT  := $@$(if $(findstring windows,$(OS)),.exe,))   # ← NEW
+	$(eval OUT  := $@$(if $(findstring windows,$(OS)),.exe,))
 
 	GOOS=$(OS) GOARCH=$(ARCH) CGO_ENABLED=0 \
 	    go build $(GOFLAGS) -o $(OUT) $(MAIN_PKG)
@@ -37,6 +47,12 @@ $(DIST)/$(APP)-%: | $(DIST)
 update-readme: $(addprefix $(DIST)/$(APP)-,$(PLATFORMS))
 	@PLATFORMS="$(PLATFORMS)" APP="$(APP)" DIST="$(DIST)" \
 	    python3 scripts/update_readme.py
+
+checksums: $(addprefix $(DIST)/$(APP)-,$(PLATFORMS))
+	@cd $(DIST) && shasum -a 256 $(DIST_BINS) > $(notdir $(CHECKSUMS_FILE))
+	@echo "→ $(CHECKSUMS_FILE)"
+
+release-artifacts: app checksums
 
 tun: | $(TUN_DIR) $(addprefix $(TUN_DIR)/tun2socks-,$(PLATFORMS))
 

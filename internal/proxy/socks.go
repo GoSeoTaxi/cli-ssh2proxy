@@ -73,6 +73,15 @@ func NewSOCKS(cfg *config.Config, dial sshclient.DialFunc, sessions *limits.Sess
 }
 
 func (s *SocksServer) Shutdown(_ context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if s.dnsR != nil {
+		s.dnsR.Close()
+	}
+	if s.ln == nil {
+		return nil
+	}
 	return s.ln.Close()
 }
 

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
@@ -16,6 +18,7 @@ import (
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
 
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/buildinfo"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/config"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/forward"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/limits"
@@ -24,6 +27,7 @@ import (
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/proxy"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/sshclient"
 	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/tun"
+	"github.com/GoSeoTaxi/cli-ssh2proxy/internal/updater"
 )
 
 const (
@@ -33,7 +37,25 @@ const (
 	timeOutIdleConnection = 30 * time.Second
 )
 
+var (
+	checkAndUpdateFn = updater.CheckAndUpdate
+	restartProcessFn = restartCurrentProcess
+)
+
+func applyRuntimeLimits() {
+	debug.SetGCPercent(-1)          //  GOGC=off
+	debug.SetMemoryLimit(125 << 20) // 125 MiB
+}
+
 func main() {
+
+	applyRuntimeLimits()
+
+	if hasVersionFlag(os.Args[1:]) {
+		fmt.Println(buildinfo.String())
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config load error: %v\n", err)
@@ -48,6 +70,14 @@ func main() {
 }
 
 func run(cfg *config.Config) error {
+	restarted, updateErr := maybeAutoUpdate(cfg)
+	if updateErr != nil {
+		return updateErr
+	}
+	if restarted {
+		return nil
+	}
+
 	logDotEnv()
 
 	bootDNS := proxy.NewDNSResolver(cfg.DNSServers, cfg.DNSv6, nil)
@@ -103,10 +133,11 @@ func run(cfg *config.Config) error {
 			return nil, e
 		}
 
-		return metrics.NewTrackConn(&metrics.CountConn{Conn: metrics.NewIdleConn(raw, timeOutIdleConnection)}), nil
+		return metrics.WrapConnForMetrics(raw, timeOutIdleConnection), nil
 	}
 
 	sessionLimiter := limits.NewSessionLimiter(cfg.MaxClientConns)
+	effectiveClientLimit := computeEffectiveClientLimit(sessionLimiter.Max(), cfg.SSHMaxChannels)
 	handshakeLimiter := limits.NewIPRateLimiter(
 		cfg.HandshakeRPS,
 		cfg.HandshakeBurst,
@@ -114,10 +145,22 @@ func run(cfg *config.Config) error {
 	)
 	zap.L().Info("client_admission_limits",
 		zap.Int64("max_client_conns", cfg.MaxClientConns),
+		zap.Int64("effective_client_limit", effectiveClientLimit),
+		zap.Int64("ssh_max_channels", cfg.SSHMaxChannels),
+		zap.Duration("slot_wait_timeout", sshclient.SlotWaitTimeout()),
 		zap.Int64("handshake_rps", cfg.HandshakeRPS),
 		zap.Int64("handshake_burst", cfg.HandshakeBurst),
 		zap.Int64("handshake_ip_ttl_sec", cfg.HandshakeIPTTLSec),
 	)
+	if reason, risky := capacityMismatchRiskReason(cfg.MaxClientConns, cfg.SSHMaxChannels); risky {
+		zap.L().Warn("capacity_mismatch_risk",
+			zap.String("reason", reason),
+			zap.Int64("max_client_conns", cfg.MaxClientConns),
+			zap.Int64("ssh_max_channels", cfg.SSHMaxChannels),
+			zap.Int64("effective_client_limit", effectiveClientLimit),
+			zap.Duration("slot_wait_timeout", sshclient.SlotWaitTimeout()),
+		)
+	}
 
 	var fwd *forward.TCPForwarder
 	fwd, err = forward.StartTCP(cfg.UDPGWLocal, cfg.UDPGWRemote, dialCount, sessionLimiter)
@@ -304,4 +347,127 @@ func maskListenPassword(value string) string {
 		return value
 	}
 	return auth[:colon+1] + "******@" + host
+}
+
+func hasVersionFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--version" || arg == "-version" {
+			return true
+		}
+	}
+	return false
+}
+
+func maybeAutoUpdate(cfg *config.Config) (bool, error) {
+	if !cfg.AutoUpdate {
+		return false, nil
+	}
+	if cfg.AutoUpdateInterval > 0 {
+		zap.L().Info("auto-update background interval is configured, startup-only mode is active in this build",
+			zap.Duration("auto_update_interval", cfg.AutoUpdateInterval))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.AutoUpdateTimeout)
+	defer cancel()
+
+	args := append([]string(nil), os.Args[1:]...)
+	executablePath, err := os.Executable()
+	if err != nil {
+		zap.L().Warn("auto-update check failed", zap.Error(fmt.Errorf("resolve executable path: %w", err)))
+		return false, nil
+	}
+	executablePath, err = filepath.Abs(executablePath)
+	if err != nil {
+		zap.L().Warn("auto-update check failed", zap.Error(fmt.Errorf("resolve executable absolute path: %w", err)))
+		return false, nil
+	}
+
+	result, err := checkAndUpdateFn(ctx, updater.Options{
+		Enabled:         cfg.AutoUpdate,
+		AllowPrerelease: cfg.AutoUpdateAllowPre,
+		Timeout:         cfg.AutoUpdateTimeout,
+		CurrentVersion:  buildinfo.Version,
+		AppName:         "ssh2proxy",
+		Args:            args,
+		ProcessID:       os.Getpid(),
+		ExecutablePath:  executablePath,
+	})
+	if err != nil {
+		zap.L().Warn("auto-update check failed", zap.Error(err))
+		return false, nil
+	}
+	if !result.Checked {
+		zap.L().Info("auto-update skipped", zap.String("current_version", buildinfo.Version))
+		return false, nil
+	}
+	if !result.UpdateAvailable {
+		zap.L().Info("auto-update check complete: no update found",
+			zap.String("current_version", result.CurrentVersion),
+			zap.String("latest_version", result.LatestVersion),
+		)
+		return false, nil
+	}
+	if !result.Updated {
+		return false, nil
+	}
+
+	zap.L().Info("auto-update installed",
+		zap.String("from", result.CurrentVersion),
+		zap.String("to", result.LatestVersion),
+	)
+
+	if result.WindowsHelperStarted {
+		zap.L().Info("windows staged update helper started; exiting current process")
+		return true, nil
+	}
+
+	if err := restartProcessFn(executablePath, args); err != nil {
+		return false, fmt.Errorf("restart after update: %w", err)
+	}
+	return true, nil
+}
+
+func restartCurrentProcess(executablePath string, args []string) error {
+	exePath := strings.TrimSpace(executablePath)
+	if exePath == "" {
+		return errors.New("resolve executable for restart: executable path is empty")
+	}
+	cmd := exec.Command(exePath, args...)
+	cmd.Env = os.Environ()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func computeEffectiveClientLimit(clientLimit, channelLimit int64) int64 {
+	if clientLimit <= 0 && channelLimit <= 0 {
+		return 0
+	}
+	if clientLimit <= 0 {
+		return channelLimit
+	}
+	if channelLimit <= 0 {
+		return clientLimit
+	}
+	if clientLimit < channelLimit {
+		return clientLimit
+	}
+	return channelLimit
+}
+
+func capacityMismatchRiskReason(clientLimit, channelLimit int64) (string, bool) {
+	if channelLimit <= 0 {
+		return "", false
+	}
+	if clientLimit <= 0 {
+		return "max_client_conns is unlimited while ssh_max_channels is limited", true
+	}
+	if clientLimit > channelLimit {
+		return "max_client_conns is greater than ssh_max_channels", true
+	}
+	return "", false
 }
