@@ -106,12 +106,83 @@ Each archive is a **single self-contained executable**—no extra libraries requ
 
 | OS&nbsp;/&nbsp;Arch      | File name                          | Size (≈) | SHA-256 checksum |
 |--------------------------|------------------------------------|----------|------------------|
-| Linux x86-64             | `ssh2proxy-linux_amd64`            | 26 MB | `7b5ae0f9b3ad6be5ced5506288425b17946204d5c93a38f6c9ea99424e466d2d` |
-| Linux ARM64 (aarch64)    | `ssh2proxy-linux_arm64`            | 25 MB | `5b770fa3ba5d987b108b61b5a2eff732bf28847967332302ded3d76f5ba5a633` |
-| macOS Intel (x86-64)     | `ssh2proxy-darwin_amd64`           | 26 MB | `7046f0e64ad3324129532ef836ee5940c1828fdcd114f3d91e69bd9d8e264842` |
-| macOS Apple Silicon      | `ssh2proxy-darwin_arm64`           | 25 MB | `6b1fdad0bd5ff93e3fb16b29775a94364dd858c32d15249b7a1ef45b8142430a` |
-| Windows x86-64           | `ssh2proxy-windows_amd64.exe`      | 27 MB | `8ebc686845696ea5101bd1a5557955412585b9cbe1c41415c70d1bd3398e76f2` |
+| Linux x86-64             | `ssh2proxy-linux_amd64`            | 26 MB | `fe621fd6cecf1ec52ae60529db1421a3de5bc58007ab4ec5b5f94bb071eb2d70` |
+| Linux ARM64 (aarch64)    | `ssh2proxy-linux_arm64`            | 26 MB | `203e354827e4164bf819250387ddc61f96186b38d4f0a926642d88ca6ef3ce0c` |
+| macOS Intel (x86-64)     | `ssh2proxy-darwin_amd64`           | 27 MB | `927c690e58868532911a3aa62fa8bddf04aceb22c31f6bd4cb88265f2122ca55` |
+| macOS Apple Silicon      | `ssh2proxy-darwin_arm64`           | 25 MB | `13e106a970de831e636b6a1e69f2a367206918caa93a17ab32f364644ea42081` |
+| Windows x86-64           | `ssh2proxy-windows_amd64.exe`      | 27 MB | `e0f0013bbf94bab8cb51029118fc4b791f5f5c6ef50a4e156b3ad1a35d5e6e3d` |
 
 > ⚠️ The **TUN / full-tunnel** mode ships experimental `tun2socks` helpers embedded inside each build.  
 > If you only need SOCKS5/HTTP proxying you can ignore them.
 
+## 7. Versioning and auto-update
+
+The binary now embeds build metadata (`Version`, `Commit`, `BuildDate`) via linker flags.
+
+```bash
+./ssh2proxy --version
+```
+
+Output example:
+
+```text
+ssh2proxy version=v1.4.2 commit=ab12cd3 build_date=2026-04-12T11:05:22Z go=go1.25.6 os=linux arch=amd64
+```
+
+### Startup auto-update (safe MVP)
+
+The updater checks GitHub Releases **before** SSH/proxy listeners are started.  
+If a newer version is found and `AUTO_UPDATE=true`, the binary is downloaded, verified, installed, and then the process is restarted with the same arguments.
+
+Config (`.env`):
+
+```dotenv
+AUTO_UPDATE=false
+AUTO_UPDATE_ALLOW_PRERELEASE=false
+AUTO_UPDATE_CHECK_INTERVAL_SEC=0
+AUTO_UPDATE_TIMEOUT_SEC=15
+```
+
+Behavior notes:
+
+- `AUTO_UPDATE_CHECK_INTERVAL_SEC=0` means check only on startup.
+- Releases are always fetched from `https://github.com/GoSeoTaxi/cli-ssh2proxy` (fixed in code).
+- `checksums.txt` is mandatory; update is rejected if it is missing.
+- A lock file is used next to the executable, so concurrent instances do not update in parallel.
+- Linux/macOS: update is applied by atomic rename over the executable.
+- Windows: running `.exe` is staged as `ssh2proxy.exe.new`; a helper process swaps files after exit and starts the updated binary.
+- If download/checksum/install fails, startup continues with the current binary (no destructive in-place mutation before verification).
+
+### Release requirements
+
+Every GitHub release must include:
+
+- platform binaries (`ssh2proxy-linux_amd64`, `...`, `ssh2proxy-windows_amd64.exe`);
+- `checksums.txt` with SHA-256 for each binary.
+
+Helper targets:
+
+```bash
+make app
+make checksums
+# or both:
+make release-artifacts
+```
+
+Without `checksums.txt`, auto-update is intentionally blocked for security reasons.
+
+## 8. Go runtime GC and memory tuning (optional)
+
+`GOGC` and `GOMEMLIMIT` are **runtime** variables, not build/linker flags.  
+Set them in the process environment that starts `ssh2proxy` (shell, systemd unit, Docker env, etc.).
+
+```bash
+GOGC=off GOMEMLIMIT=125MiB ./ssh2proxy
+```
+
+Notes:
+
+- `GOGC=off` disables heap-growth GC triggering.
+- `GOMEMLIMIT=125MiB` sets a **soft** memory target for Go-managed memory.
+- With `GOMEMLIMIT` set, the runtime may still run GC even when `GOGC=off`.
+- `125MiB` is not a strict process RSS cap: total OS-visible memory can be higher due to non-Go allocations and runtime/OS overhead.
